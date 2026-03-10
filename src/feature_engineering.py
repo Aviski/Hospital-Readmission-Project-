@@ -51,6 +51,7 @@ def create_features(df: pd.DataFrame, config: dict) -> pd.DataFrame:
     df = _add_age_group(df, feat_cfg)
     df = _add_prior_admission_flag(df, feat_cfg)
     df = _add_discharge_disposition_group(df, feat_cfg)
+    df = _add_interaction_features(df, feat_cfg)
 
     logger.info("Feature engineering complete. Shape: %d rows × %d columns",
                 df.shape[0], df.shape[1])
@@ -213,4 +214,61 @@ def _add_discharge_disposition_group(df: pd.DataFrame, feat_cfg: dict) -> pd.Dat
         col,
         df["discharge_disposition_cat"].value_counts().to_string(),
     )
+    return df
+
+
+def _add_interaction_features(df: pd.DataFrame, feat_cfg: dict) -> pd.DataFrame:
+    """Multiply pairs of numeric columns to create interaction terms.
+
+    Configuration keys used (under ``features.interactions``):
+        - ``enabled`` – bool flag to toggle all interactions on/off.
+        - ``terms``   – list of [col_a, col_b] pairs.  A column named
+          ``{col_a}_x_{col_b}`` is created for each pair.
+
+    Only pairs where both columns are present in ``df`` are created.
+    Non-numeric source columns raise a warning and are skipped.
+
+    Example config::
+
+        features:
+          interactions:
+            enabled: true
+            terms:
+              - ["Age", "Comorbidity_Index"]
+              - ["Severity_Score", "Length_of_Stay"]
+    """
+    interaction_cfg = feat_cfg.get("interactions", {})
+    if not interaction_cfg.get("enabled", False):
+        return df
+
+    terms: list[list[str]] = interaction_cfg.get("terms", [])
+    if not terms:
+        logger.info("interactions.enabled=true but no terms defined — skipping.")
+        return df
+
+    created = []
+    for pair in terms:
+        if len(pair) != 2:
+            logger.warning("Interaction term %s must have exactly 2 columns — skipping.", pair)
+            continue
+        col_a, col_b = pair
+        if col_a not in df.columns or col_b not in df.columns:
+            logger.warning(
+                "Interaction term (%s × %s): one or both columns not found — skipping.",
+                col_a, col_b,
+            )
+            continue
+        if not pd.api.types.is_numeric_dtype(df[col_a]) or \
+                not pd.api.types.is_numeric_dtype(df[col_b]):
+            logger.warning(
+                "Interaction term (%s × %s): non-numeric column — skipping.",
+                col_a, col_b,
+            )
+            continue
+        new_col = f"{col_a}_x_{col_b}"
+        df[new_col] = df[col_a] * df[col_b]
+        created.append(new_col)
+
+    if created:
+        logger.info("Created %d interaction feature(s): %s", len(created), created)
     return df

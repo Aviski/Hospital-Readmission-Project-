@@ -11,6 +11,7 @@ paths:
   model_dir:      "models/"
   figures_dir:    "reports/figures/"
   metrics_out:    "data/processed/metrics_summary.csv"
+  metrics_tuned:  "data/processed/metrics_tuned_summary.csv"
 
 random_seed: 42
 
@@ -20,13 +21,11 @@ random_seed: 42
 data:
   target_column: "Readmitted_Within_30_Days"
   test_size: 0.20
-  val_size: 0.20        # fraction of TOTAL data used for validation
-  stratify: true
+  val_size:  0.20
+  stratify:  true
 
-  # Columns to drop before modelling (IDs, free-text, leakage, etc.)
   drop_columns: []
 
-  # Categorical columns to one-hot encode.
   categorical_columns:
     - "Gender"
     - "Insurance_Type"
@@ -34,11 +33,9 @@ data:
     - "Primary_Diagnosis_Group"
     - "Discharge_Disposition"
 
-  # Imputation strategies (safety net even if dataset has no NAs)
   numeric_impute_strategy: "median"
   categorical_impute_value: "Unknown"
 
-  # Clip physically-impossible numeric values: {col: [min, max]}  null = no bound
   clip_values:
     Creatinine_Level: [0.0, null]
 
@@ -46,67 +43,111 @@ data:
 # Feature engineering
 # ---------------------------------------------------------------------------
 features:
-  age_bins: [0, 40, 65, 80, 120]
+  age_bins:   [0, 40, 65, 80, 120]
   age_labels: ["<40", "40-64", "65-79", "80+"]
 
-  age_col: "Age"
-  comorbidity_cols: []           # empty → Comorbidity_Index used directly
-  prior_admissions_col: "Previous_Admissions_6M"
+  age_col:                  "Age"
+  comorbidity_cols:         []
+  prior_admissions_col:     "Previous_Admissions_6M"
   discharge_disposition_col: "Discharge_Disposition"
+
+  # Optional interaction terms.
+  # Each entry is [col_a, col_b] — creates col_a × col_b column.
+  # Both columns must exist in the cleaned (pre-OHE) DataFrame.
+  interactions:
+    enabled: true
+    terms:
+      - ["Age",           "Comorbidity_Index"]
+      - ["Severity_Score", "Length_of_Stay"]
 
 # ---------------------------------------------------------------------------
 # Modeling
 # ---------------------------------------------------------------------------
 model:
-  # ---- Leakage / exclusion -----------------------------------------------
-  # These columns are POST-DISCHARGE observations not available at prediction time.
-  # Flagged for exclusion during modeling. Comment out to include them.
+  # ---- Leakage exclusions (post-discharge observations) ------------------
   exclude_columns:
-    - "Followup_Appointment_Scheduled"   # decided after discharge
-    - "Medication_Adherence_Score"        # measured post-discharge
+    - "Followup_Appointment_Scheduled"
+    - "Medication_Adherence_Score"
 
-  # Columns to watch for indirect leakage (kept in, but investigate):
-  # - Time_Since_Last_Discharge  (may encode data-collection bias)
-  # - Previous_Readmissions_1Y   (overlaps with target for re-admission events)
+  # ---- Redundant / collinear column removal --------------------------------
+  # age_group_* OHE columns duplicate continuous Age.
+  # discharge_disposition_cat_* is a coarser re-encoding of Discharge_Disposition_*.
+  # These are dropped in load_features() before any model sees the data.
+  drop_redundant_cols:
+    - "age_group_<40"
+    - "age_group_40-64"
+    - "age_group_65-79"
+    - "age_group_80+"
+    - "discharge_disposition_cat_Facility"
+    - "discharge_disposition_cat_Home"
 
-  # ---- Splits ------------------------------------------------------------
+  # ---- Splits & CV --------------------------------------------------------
   cv_folds: 5
 
-  # ---- Logistic Regression -----------------------------------------------
+  # ---- Logistic Regression (wrapped in StandardScaler Pipeline) -----------
   logistic_regression:
-    C: 1.0
-    max_iter: 1000
+    C:            1.0
+    max_iter:     1000
     class_weight: "balanced"
-    solver: "lbfgs"
+    solver:       "lbfgs"
+    penalty:      "l2"
 
   # ---- Random Forest -------------------------------------------------------
   random_forest:
-    n_estimators: 300
-    max_depth: null
+    n_estimators:    200
+    max_depth:       null
     min_samples_leaf: 10
-    class_weight: "balanced"
-    n_jobs: -1
+    class_weight:    "balanced"
+    n_jobs:          -1
 
-  # ---- Gradient Boosting (sklearn HistGradientBoosting / XGBoost fallback) -
+  # ---- Gradient Boosting (sklearn HGBC / XGBoost fallback) ----------------
   gradient_boosting:
-    max_iter: 300          # sklearn HGBC uses max_iter; XGBoost uses n_estimators
-    learning_rate: 0.05
-    max_depth: 6
+    max_iter:         200
+    learning_rate:    0.05
+    max_depth:        6
     min_samples_leaf: 20
-    class_weight: "balanced"  # supported by sklearn HGBC >= 1.2
-    # XGBoost-specific (used only if xgboost is installed):
-    n_estimators: 300
-    subsample: 0.8
+    class_weight:     "balanced"
+    # XGBoost-specific (used if xgboost installed):
+    n_estimators:     200
+    subsample:        0.8
     colsample_bytree: 0.8
-    scale_pos_weight: 0.35   # neg/pos ratio: ~4651/13349
+    scale_pos_weight: 0.35
 
-  # ---- Tuning scaffold (Phase 4) -----------------------------------------
+  # ---- Hyperparameter tuning ----------------------------------------------
   tuning:
-    n_iter: 50
+    n_iter:   20          # RandomizedSearchCV iterations
     cv_folds: 5
-    scoring: "average_precision"   # PR-AUC — primary metric given class imbalance
+    scoring:  "roc_auc"   # roc_auc gives cleaner signal on this dataset
 
-  # ---- Calibration scaffold (Phase 4) ------------------------------------
+    # Parameter search spaces per model.
+    # Pipeline-wrapped models use "classifier__" prefix for their params.
+    param_spaces:
+      LogisticRegression:
+        classifier__C:       [0.001, 0.01, 0.1, 0.5, 1.0, 5.0, 10.0, 50.0]
+        classifier__penalty: ["l1", "l2"]
+        classifier__solver:  ["liblinear", "saga"]
+
+      RandomForest:
+        n_estimators:      [100, 150, 200, 300]
+        max_depth:         [5, 10, 15, 20, null]
+        min_samples_split: [2, 5, 10]
+        min_samples_leaf:  [5, 10, 20]
+
+      GradientBoosting:
+        learning_rate:    [0.01, 0.05, 0.1, 0.2]
+        max_iter:         [100, 150, 200, 300]
+        max_depth:        [3, 4, 5, 6, 7]
+        min_samples_leaf: [10, 20, 30, 50]
+
+  # ---- Calibration --------------------------------------------------------
   calibration:
-    method: "isotonic"   # "isotonic" or "sigmoid"
-    cv: 5
+    methods: ["sigmoid", "isotonic"]   # both compared; best kept
+    cv:      5
+
+  # ---- Threshold analysis -------------------------------------------------
+  threshold:
+    sweep_min:      0.05
+    sweep_max:      0.95
+    sweep_step:     0.05
+    optimize_by:    "f1"          # "f1" | "recall" | "precision"
+    recall_target:  0.80          # minimum recall when optimize_by="recall"
