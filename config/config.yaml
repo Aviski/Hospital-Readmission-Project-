@@ -1,0 +1,81 @@
+# =============================================================================
+# Hospital Readmission Risk — Central Configuration
+# =============================================================================
+
+paths:
+  raw_data:       "data/raw/readmission.csv"
+  cleaned_data:   "data/processed/cleaned.csv"
+  features_data:  "data/processed/features.csv"
+  model_dir:      "models/"
+
+random_seed: 42
+
+# ---------------------------------------------------------------------------
+# Data preparation
+# ---------------------------------------------------------------------------
+data:
+  target_column: "readmitted_30d"
+  test_size: 0.20
+  val_size: 0.20        # fraction of remaining train data used for validation
+  stratify: true
+
+  # Columns to drop before modelling (IDs, free-text, leakage, etc.)
+  drop_columns: []
+
+  # Categorical columns that should receive one-hot encoding
+  # Leave empty to auto-detect object/category dtype columns
+  categorical_columns: []
+
+  # Numeric columns to force a specific imputation strategy
+  # (fallback is always median for numeric, "Unknown" for categorical)
+  numeric_impute_strategy: "median"
+  categorical_impute_value: "Unknown"
+
+# ---------------------------------------------------------------------------
+# Feature engineering
+# ---------------------------------------------------------------------------
+features:
+  age_bins: [0, 18, 40, 65, 80, 120]
+  age_labels: ["<18", "18-39", "40-64", "65-79", "80+"]
+
+  # Column names expected in the dataset — adjust to match actual CSV headers
+  age_col: "age"
+  comorbidity_cols: []           # list of binary 0/1 comorbidity flag columns
+  prior_admissions_col: null     # e.g. "prior_admissions_12m"
+  discharge_disposition_col: null
+
+# ---------------------------------------------------------------------------
+# Model hyperparameters
+# ---------------------------------------------------------------------------
+model:
+  logistic_regression:
+    C: 1.0
+    max_iter: 1000
+    class_weight: "balanced"
+    solver: "lbfgs"
+
+  random_forest:
+    n_estimators: 300
+    max_depth: null
+    min_samples_leaf: 10
+    class_weight: "balanced"
+    n_jobs: -1
+
+  gradient_boosting:          # XGBoost / LightGBM compatible key names
+    n_estimators: 500
+    learning_rate: 0.05
+    max_depth: 6
+    subsample: 0.8
+    colsample_bytree: 0.8
+    scale_pos_weight: null    # set to (negatives/positives) to handle imbalance
+
+  # RandomizedSearchCV settings
+  tuning:
+    n_iter: 50
+    cv_folds: 5
+    scoring: "average_precision"   # PR-AUC as primary metric
+
+  # Calibration
+  calibration:
+    method: "isotonic"             # "isotonic" or "sigmoid"
+    cv: 5
