@@ -15,6 +15,8 @@ reports/figures/*
 # Python
 __pycache__/
 *.py[cod]
+*.pyo
+*.pyd
 *.egg-info/
 dist/
 build/
@@ -27,6 +29,7 @@ env/
 
 # Jupyter
 .ipynb_checkpoints/
+*.ipynb_checkpoints
 
 # Environment files
 .env
@@ -36,6 +39,9 @@ env/
 .vscode/
 .idea/
 *.swp
+
+# Claude / AI tooling
+.claude/
 
 # OS
 .DS_Store
