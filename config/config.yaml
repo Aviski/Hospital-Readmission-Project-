@@ -7,8 +7,10 @@
 paths:
   raw_data:       "data/raw/hospital_readmission_risk_dataset_2026_v1_18000rows.csv"
   cleaned_data:   "data/processed/cleaned.csv"
-  features_data:  "data/processed/features.csv"
+  features_data:  "data/processed/readmission_features.csv"
   model_dir:      "models/"
+  figures_dir:    "reports/figures/"
+  metrics_out:    "data/processed/metrics_summary.csv"
 
 random_seed: 42
 
@@ -18,14 +20,13 @@ random_seed: 42
 data:
   target_column: "Readmitted_Within_30_Days"
   test_size: 0.20
-  val_size: 0.20        # fraction of remaining train data used for validation
+  val_size: 0.20        # fraction of TOTAL data used for validation
   stratify: true
 
   # Columns to drop before modelling (IDs, free-text, leakage, etc.)
   drop_columns: []
 
   # Categorical columns to one-hot encode.
-  # Explicitly listed to avoid accidental encoding of the target or binary flags.
   categorical_columns:
     - "Gender"
     - "Insurance_Type"
@@ -33,14 +34,13 @@ data:
     - "Primary_Diagnosis_Group"
     - "Discharge_Disposition"
 
-  # Imputation strategies (applied even if no NAs exist, as a safety net)
+  # Imputation strategies (safety net even if dataset has no NAs)
   numeric_impute_strategy: "median"
   categorical_impute_value: "Unknown"
 
-  # Value clipping for physically-impossible numeric values.
-  # Format: {column_name: [min_valid, max_valid]}  — null means no bound on that side.
+  # Clip physically-impossible numeric values: {col: [min, max]}  null = no bound
   clip_values:
-    Creatinine_Level: [0.0, null]   # 31 rows have negative values in the raw data
+    Creatinine_Level: [0.0, null]
 
 # ---------------------------------------------------------------------------
 # Feature engineering
@@ -49,31 +49,37 @@ features:
   age_bins: [0, 40, 65, 80, 120]
   age_labels: ["<40", "40-64", "65-79", "80+"]
 
-  # Column names matched to actual dataset headers
   age_col: "Age"
-
-  # Binary 0/1 comorbidity flag columns to sum into comorbidity_count.
-  # This dataset uses Comorbidity_Index (0-5 score) and Chronic_Disease_Count (0-4)
-  # rather than individual binary disease flags, so this list is intentionally empty.
-  # comorbidity_count will not be generated; use Comorbidity_Index directly in modelling.
-  comorbidity_cols: []
-
-  # Column holding a count of prior admissions (used to create prior_admission_flag)
+  comorbidity_cols: []           # empty → Comorbidity_Index used directly
   prior_admissions_col: "Previous_Admissions_6M"
-
-  # Column holding discharge disposition labels
   discharge_disposition_col: "Discharge_Disposition"
 
 # ---------------------------------------------------------------------------
-# Model hyperparameters
+# Modeling
 # ---------------------------------------------------------------------------
 model:
+  # ---- Leakage / exclusion -----------------------------------------------
+  # These columns are POST-DISCHARGE observations not available at prediction time.
+  # Flagged for exclusion during modeling. Comment out to include them.
+  exclude_columns:
+    - "Followup_Appointment_Scheduled"   # decided after discharge
+    - "Medication_Adherence_Score"        # measured post-discharge
+
+  # Columns to watch for indirect leakage (kept in, but investigate):
+  # - Time_Since_Last_Discharge  (may encode data-collection bias)
+  # - Previous_Readmissions_1Y   (overlaps with target for re-admission events)
+
+  # ---- Splits ------------------------------------------------------------
+  cv_folds: 5
+
+  # ---- Logistic Regression -----------------------------------------------
   logistic_regression:
     C: 1.0
     max_iter: 1000
     class_weight: "balanced"
     solver: "lbfgs"
 
+  # ---- Random Forest -------------------------------------------------------
   random_forest:
     n_estimators: 300
     max_depth: null
@@ -81,22 +87,26 @@ model:
     class_weight: "balanced"
     n_jobs: -1
 
-  gradient_boosting:          # XGBoost / LightGBM compatible key names
-    n_estimators: 500
+  # ---- Gradient Boosting (sklearn HistGradientBoosting / XGBoost fallback) -
+  gradient_boosting:
+    max_iter: 300          # sklearn HGBC uses max_iter; XGBoost uses n_estimators
     learning_rate: 0.05
     max_depth: 6
+    min_samples_leaf: 20
+    class_weight: "balanced"  # supported by sklearn HGBC >= 1.2
+    # XGBoost-specific (used only if xgboost is installed):
+    n_estimators: 300
     subsample: 0.8
     colsample_bytree: 0.8
-    # Negative-to-positive ratio for scale_pos_weight: ~4651/13349 ≈ 0.35
-    scale_pos_weight: 0.35
+    scale_pos_weight: 0.35   # neg/pos ratio: ~4651/13349
 
-  # RandomizedSearchCV settings
+  # ---- Tuning scaffold (Phase 4) -----------------------------------------
   tuning:
     n_iter: 50
     cv_folds: 5
-    scoring: "average_precision"   # PR-AUC as primary metric
+    scoring: "average_precision"   # PR-AUC — primary metric given class imbalance
 
-  # Calibration
+  # ---- Calibration scaffold (Phase 4) ------------------------------------
   calibration:
-    method: "isotonic"             # "isotonic" or "sigmoid"
+    method: "isotonic"   # "isotonic" or "sigmoid"
     cv: 5
