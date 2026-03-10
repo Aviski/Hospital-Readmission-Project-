@@ -77,15 +77,24 @@ except ImportError:
 # Internal helpers
 # ---------------------------------------------------------------------------
 
-def _figures_dir(config: dict) -> Path:
-    """Return (and create) the figures output directory.
+def _figures_dir(config: dict, subfolder: str = "") -> Path:
+    """Return (and create) a figures output directory.
 
-    Resolves against ``config['_base_dir']`` when present — set by notebook
-    callers to anchor relative paths to the project root.
+    Resolves against ``config['_base_dir']`` when present (set by notebook
+    callers to anchor relative paths to the project root).  An optional
+    ``subfolder`` (e.g. ``"modeling"``, ``"tuning"``) is appended after the
+    base figures directory, allowing plots to be organised into sub-directories.
+    The caller can also set ``config['_figures_subfolder']`` as a default for
+    the entire session; an explicit ``subfolder`` argument takes precedence.
+
+    Final path: ``{figures_dir}/{subfolder}/``
     """
-    raw  = config.get("paths", {}).get("figures_dir", "reports/figures/")
-    base = config.get("_base_dir")
-    p    = Path(base) / raw if base else Path(raw)
+    raw      = config.get("paths", {}).get("figures_dir", "reports/figures/")
+    base     = config.get("_base_dir")
+    sub      = subfolder or config.get("_figures_subfolder", "")
+    p        = Path(base) / raw if base else Path(raw)
+    if sub:
+        p = p / sub
     p.mkdir(parents=True, exist_ok=True)
     return p
 
