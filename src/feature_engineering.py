@@ -70,23 +70,23 @@ def _add_comorbidity_count(df: pd.DataFrame, feat_cfg: dict) -> pd.DataFrame:
     """
     comorbidity_cols: list[str] = feat_cfg.get("comorbidity_cols", [])
 
-    # Auto-detect if not specified
+    # Auto-detect only if a non-empty list was provided and all columns exist.
+    # If comorbidity_cols is empty, skip silently — the dataset may already
+    # include a composite score (e.g. Comorbidity_Index) that is more reliable
+    # than summing auto-detected columns.
     if not comorbidity_cols:
-        keywords = (
-            "diabetes", "hypertension", "copd", "chf", "renal", "liver",
-            "cancer", "stroke", "dementia", "depression", "comorbid",
+        logger.info(
+            "features.comorbidity_cols is empty — skipping 'comorbidity_count'. "
+            "Use Comorbidity_Index / Chronic_Disease_Count directly in modelling."
         )
-        comorbidity_cols = [
-            c for c in df.columns
-            if any(kw in c.lower() for kw in keywords)
-        ]
+        return df
 
     available = [c for c in comorbidity_cols if c in df.columns]
+    missing = set(comorbidity_cols) - set(available)
+    if missing:
+        logger.warning("Comorbidity column(s) not found and will be skipped: %s", missing)
     if not available:
-        logger.warning(
-            "No comorbidity columns found — skipping 'comorbidity_count'. "
-            "Set 'features.comorbidity_cols' in config.yaml."
-        )
+        logger.warning("No comorbidity columns available — skipping 'comorbidity_count'.")
         return df
 
     df["comorbidity_count"] = df[available].sum(axis=1)
@@ -182,18 +182,21 @@ def _add_discharge_disposition_group(df: pd.DataFrame, feat_cfg: dict) -> pd.Dat
         )
         return df
 
-    # Placeholder mapping — expand / replace to match actual dataset values
+    # Mapping covers the current dataset values and common CMS equivalents.
+    # Add entries here as new datasets introduce different label conventions.
     DISPOSITION_MAP: dict[str, str] = {
         # Home
         "home": "Home",
         "home health": "Home",
         "home with home health service": "Home",
-        # Facility
-        "snf": "Facility",
-        "skilled nursing facility": "Facility",
+        # Facility (post-acute / institutional care)
         "rehab": "Facility",
         "inpatient rehabilitation": "Facility",
+        "nursing facility": "Facility",
+        "skilled nursing facility": "Facility",
+        "snf": "Facility",
         "long term care hospital": "Facility",
+        "ltch": "Facility",
         # AMA / Other
         "ama": "AMA/Other",
         "left against medical advice": "AMA/Other",

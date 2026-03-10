@@ -1,9 +1,11 @@
 # =============================================================================
 # Hospital Readmission Risk — Central Configuration
+# Dataset: hospital_readmission_risk_dataset_2026_v1_18000rows.csv
+# Rows: 18,000 | Columns: 25 | Positive rate: ~74%
 # =============================================================================
 
 paths:
-  raw_data:       "data/raw/readmission.csv"
+  raw_data:       "data/raw/hospital_readmission_risk_dataset_2026_v1_18000rows.csv"
   cleaned_data:   "data/processed/cleaned.csv"
   features_data:  "data/processed/features.csv"
   model_dir:      "models/"
@@ -14,7 +16,7 @@ random_seed: 42
 # Data preparation
 # ---------------------------------------------------------------------------
 data:
-  target_column: "readmitted_30d"
+  target_column: "Readmitted_Within_30_Days"
   test_size: 0.20
   val_size: 0.20        # fraction of remaining train data used for validation
   stratify: true
@@ -22,27 +24,45 @@ data:
   # Columns to drop before modelling (IDs, free-text, leakage, etc.)
   drop_columns: []
 
-  # Categorical columns that should receive one-hot encoding
-  # Leave empty to auto-detect object/category dtype columns
-  categorical_columns: []
+  # Categorical columns to one-hot encode.
+  # Explicitly listed to avoid accidental encoding of the target or binary flags.
+  categorical_columns:
+    - "Gender"
+    - "Insurance_Type"
+    - "Admission_Type"
+    - "Primary_Diagnosis_Group"
+    - "Discharge_Disposition"
 
-  # Numeric columns to force a specific imputation strategy
-  # (fallback is always median for numeric, "Unknown" for categorical)
+  # Imputation strategies (applied even if no NAs exist, as a safety net)
   numeric_impute_strategy: "median"
   categorical_impute_value: "Unknown"
+
+  # Value clipping for physically-impossible numeric values.
+  # Format: {column_name: [min_valid, max_valid]}  — null means no bound on that side.
+  clip_values:
+    Creatinine_Level: [0.0, null]   # 31 rows have negative values in the raw data
 
 # ---------------------------------------------------------------------------
 # Feature engineering
 # ---------------------------------------------------------------------------
 features:
-  age_bins: [0, 18, 40, 65, 80, 120]
-  age_labels: ["<18", "18-39", "40-64", "65-79", "80+"]
+  age_bins: [0, 40, 65, 80, 120]
+  age_labels: ["<40", "40-64", "65-79", "80+"]
 
-  # Column names expected in the dataset — adjust to match actual CSV headers
-  age_col: "age"
-  comorbidity_cols: []           # list of binary 0/1 comorbidity flag columns
-  prior_admissions_col: null     # e.g. "prior_admissions_12m"
-  discharge_disposition_col: null
+  # Column names matched to actual dataset headers
+  age_col: "Age"
+
+  # Binary 0/1 comorbidity flag columns to sum into comorbidity_count.
+  # This dataset uses Comorbidity_Index (0-5 score) and Chronic_Disease_Count (0-4)
+  # rather than individual binary disease flags, so this list is intentionally empty.
+  # comorbidity_count will not be generated; use Comorbidity_Index directly in modelling.
+  comorbidity_cols: []
+
+  # Column holding a count of prior admissions (used to create prior_admission_flag)
+  prior_admissions_col: "Previous_Admissions_6M"
+
+  # Column holding discharge disposition labels
+  discharge_disposition_col: "Discharge_Disposition"
 
 # ---------------------------------------------------------------------------
 # Model hyperparameters
@@ -67,7 +87,8 @@ model:
     max_depth: 6
     subsample: 0.8
     colsample_bytree: 0.8
-    scale_pos_weight: null    # set to (negatives/positives) to handle imbalance
+    # Negative-to-positive ratio for scale_pos_weight: ~4651/13349 ≈ 0.35
+    scale_pos_weight: 0.35
 
   # RandomizedSearchCV settings
   tuning:
