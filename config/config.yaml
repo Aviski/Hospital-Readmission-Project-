@@ -1,17 +1,17 @@
 # =============================================================================
-# Hospital Readmission Risk — Central Configuration
-# Dataset: hospital_readmission_risk_dataset_2026_v1_18000rows.csv
-# Rows: 18,000 | Columns: 25 | Positive rate: ~74%
+# Hospital Readmission Predictor — Central Configuration
+# Dataset: hospital_readmissions.csv
+# Rows: 25,000 | Columns: 17 | Target: readmitted (yes/no → 1/0)
+# Positive rate: ~45.3% (nearly balanced)
 # =============================================================================
 
 paths:
-  raw_data:       "data/raw/hospital_readmission_risk_dataset_2026_v1_18000rows.csv"
-  cleaned_data:   "data/processed/cleaned.csv"
-  features_data:  "data/processed/readmission_features.csv"
-  model_dir:      "models/"
-  figures_dir:    "reports/figures/"
-  metrics_out:    "data/processed/metrics_summary.csv"
-  metrics_tuned:  "data/processed/metrics_tuned_summary.csv"
+  raw_data:      "data/raw/hospital_readmissions.csv"
+  features_data: "data/processed/readmission_features.csv"
+  model_dir:     "models/"
+  figures_dir:   "reports/figures/"
+  metrics_out:   "data/processed/metrics_summary.csv"
+  metrics_tuned: "data/processed/metrics_tuned_summary.csv"
 
 random_seed: 42
 
@@ -19,69 +19,88 @@ random_seed: 42
 # Data preparation
 # ---------------------------------------------------------------------------
 data:
-  target_column: "Readmitted_Within_30_Days"
-  test_size: 0.20
-  val_size:  0.20
-  stratify:  true
+  target_column:        "readmitted"
+  target_positive_value: "yes"   # mapped to 1; "no" → 0
+  test_size:  0.20
+  val_size:   0.20
+  stratify:   true
 
+  # Columns to drop before any processing
   drop_columns: []
 
+  # Schema declaration — used for validation in _validate()
+  required_columns:
+    - "age"
+    - "time_in_hospital"
+    - "n_lab_procedures"
+    - "n_procedures"
+    - "n_medications"
+    - "n_outpatient"
+    - "n_inpatient"
+    - "n_emergency"
+    - "medical_specialty"
+    - "diag_1"
+    - "diag_2"
+    - "diag_3"
+    - "glucose_test"
+    - "A1Ctest"
+    - "change"
+    - "diabetes_med"
+    - "readmitted"
+
   categorical_columns:
-    - "Gender"
-    - "Insurance_Type"
-    - "Admission_Type"
-    - "Primary_Diagnosis_Group"
-    - "Discharge_Disposition"
+    - "medical_specialty"
+    - "diag_1"
+    - "diag_2"
+    - "diag_3"
+    - "glucose_test"
+    - "A1Ctest"
+    - "change"
+    - "diabetes_med"
 
   numeric_impute_strategy: "median"
-  categorical_impute_value: "Unknown"
-
-  clip_values:
-    Creatinine_Level: [0.0, null]
+  # Note: "Missing" in medical_specialty is a valid category, not NaN —
+  # do NOT impute it. No clip_values needed for this dataset.
 
 # ---------------------------------------------------------------------------
 # Feature engineering
 # ---------------------------------------------------------------------------
 features:
-  age_bins:   [0, 40, 65, 80, 120]
-  age_labels: ["<40", "40-64", "65-79", "80+"]
+  # Age bracket → ordinal integer (ordered, appropriate for LR)
+  age_brackets:
+    "[40-50)": 1
+    "[50-60)": 2
+    "[60-70)": 3
+    "[70-80)": 4
+    "[80-90)": 5
+    "[90-100)": 6
 
-  age_col:                  "Age"
-  comorbidity_cols:         []
-  prior_admissions_col:     "Previous_Admissions_6M"
-  discharge_disposition_col: "Discharge_Disposition"
+  # Binary flags for any prior utilization
+  prior_utilization_cols:
+    - "n_inpatient"
+    - "n_emergency"
 
-  # Optional interaction terms.
-  # Each entry is [col_a, col_b] — creates col_a × col_b column.
-  # Both columns must exist in the cleaned (pre-OHE) DataFrame.
+  # medical_specialty "Missing" sentinel value
+  specialty_missing_value: "Missing"
+
+  # Interaction terms — both columns must be numeric at the time of creation
   interactions:
     enabled: true
     terms:
-      - ["Age",           "Comorbidity_Index"]
-      - ["Severity_Score", "Length_of_Stay"]
+      - ["n_inpatient",   "time_in_hospital"]
+      - ["n_medications", "time_in_hospital"]
 
 # ---------------------------------------------------------------------------
 # Modeling
 # ---------------------------------------------------------------------------
 model:
-  # ---- Leakage exclusions (post-discharge observations) ------------------
-  exclude_columns:
-    - "Followup_Appointment_Scheduled"
-    - "Medication_Adherence_Score"
+  # No leakage exclusions needed for this dataset
+  exclude_columns: []
 
-  # ---- Redundant / collinear column removal --------------------------------
-  # age_group_* OHE columns duplicate continuous Age.
-  # discharge_disposition_cat_* is a coarser re-encoding of Discharge_Disposition_*.
-  # These are dropped in load_features() before any model sees the data.
-  drop_redundant_cols:
-    - "age_group_<40"
-    - "age_group_40-64"
-    - "age_group_65-79"
-    - "age_group_80+"
-    - "discharge_disposition_cat_Facility"
-    - "discharge_disposition_cat_Home"
+  # After OHE with drop_first=True, reference categories are already removed.
+  # Populate once encoding output is confirmed.
+  drop_redundant_cols: []
 
-  # ---- Splits & CV --------------------------------------------------------
   cv_folds: 5
 
   # ---- Logistic Regression (wrapped in StandardScaler Pipeline) -----------
@@ -94,60 +113,54 @@ model:
 
   # ---- Random Forest -------------------------------------------------------
   random_forest:
-    n_estimators:    200
-    max_depth:       null
+    n_estimators:     200
+    max_depth:        null
     min_samples_leaf: 10
-    class_weight:    "balanced"
-    n_jobs:          -1
+    class_weight:     "balanced"
+    n_jobs:           -1
 
-  # ---- Gradient Boosting (sklearn HGBC / XGBoost fallback) ----------------
+  # ---- Gradient Boosting (sklearn HistGradientBoostingClassifier) ----------
+  # XGBoost / LightGBM are NOT dependencies.
   gradient_boosting:
     max_iter:         200
     learning_rate:    0.05
-    max_depth:        6
+    max_depth:        5
     min_samples_leaf: 20
     class_weight:     "balanced"
-    # XGBoost-specific (used if xgboost installed):
-    n_estimators:     200
-    subsample:        0.8
-    colsample_bytree: 0.8
-    scale_pos_weight: 0.35
 
   # ---- Hyperparameter tuning ----------------------------------------------
   tuning:
-    n_iter:   20          # RandomizedSearchCV iterations
-    cv_folds: 5
-    scoring:  "roc_auc"   # roc_auc gives cleaner signal on this dataset
+    n_iter:        20
+    cv_folds:      5
+    scoring:       "roc_auc"
+    recall_target: 0.80   # used when optimize_by="recall"
 
-    # Parameter search spaces per model.
-    # Pipeline-wrapped models use "classifier__" prefix for their params.
     param_spaces:
       LogisticRegression:
-        classifier__C:       [0.001, 0.01, 0.1, 0.5, 1.0, 5.0, 10.0, 50.0]
+        classifier__C:       [0.001, 0.01, 0.1, 0.5, 1.0, 5.0, 10.0]
         classifier__penalty: ["l1", "l2"]
         classifier__solver:  ["liblinear", "saga"]
 
       RandomForest:
-        n_estimators:      [100, 150, 200, 300]
-        max_depth:         [5, 10, 15, 20, null]
+        n_estimators:      [100, 200, 300]
+        max_depth:         [5, 10, 15, null]
         min_samples_split: [2, 5, 10]
         min_samples_leaf:  [5, 10, 20]
 
       GradientBoosting:
         learning_rate:    [0.01, 0.05, 0.1, 0.2]
         max_iter:         [100, 150, 200, 300]
-        max_depth:        [3, 4, 5, 6, 7]
+        max_depth:        [3, 4, 5, 6]
         min_samples_leaf: [10, 20, 30, 50]
 
   # ---- Calibration --------------------------------------------------------
   calibration:
-    methods: ["sigmoid", "isotonic"]   # both compared; best kept
-    cv:      5
+    methods: ["sigmoid", "isotonic"]
 
   # ---- Threshold analysis -------------------------------------------------
   threshold:
-    sweep_min:      0.05
-    sweep_max:      0.95
-    sweep_step:     0.05
-    optimize_by:    "f1"          # "f1" | "recall" | "precision"
-    recall_target:  0.80          # minimum recall when optimize_by="recall"
+    optimize_by:   "recall"    # find max-precision threshold at recall >= recall_target
+    recall_target: 0.80
+    sweep_min:     0.05
+    sweep_max:     0.95
+    sweep_step:    0.05

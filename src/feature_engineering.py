@@ -1,9 +1,27 @@
 """
-feature_engineering.py — Healthcare-focused feature engineering.
+feature_engineering.py — Healthcare feature engineering for hospital_readmissions.csv.
 
 Public API
 ----------
     create_features(df, config)  – build derived features and return augmented DataFrame
+
+Dataset schema expected
+-----------------------
+    age                – categorical bracket strings: "[40-50)", "[50-60)", ...
+    time_in_hospital   – integer days admitted
+    n_lab_procedures   – integer
+    n_procedures       – integer
+    n_medications      – integer
+    n_outpatient       – prior outpatient visits
+    n_inpatient        – prior inpatient admissions
+    n_emergency        – prior emergency visits
+    medical_specialty  – categorical; 49.5% of values are the string "Missing"
+    diag_1/2/3         – categorical diagnosis codes
+    glucose_test       – categorical: no/normal/high
+    A1Ctest            – categorical: no/normal/high
+    change             – categorical: yes/no
+    diabetes_med       – categorical: yes/no
+    readmitted         – binary target (already mapped to 0/1 by clean_data)
 """
 
 from __future__ import annotations
@@ -22,15 +40,16 @@ logger = get_logger(__name__)
 def create_features(df: pd.DataFrame, config: dict) -> pd.DataFrame:
     """Generate engineered features from a cleaned DataFrame.
 
-    The function is designed to be **flexible**: each sub-routine checks
-    whether the required source columns are present before attempting to
-    create the feature, and logs a warning if they are not.
+    Features added:
+        - ``age_ordinal``              – ordered integer from age bracket string
+        - ``any_n_inpatient``          – binary: any prior inpatient admission
+        - ``any_n_emergency``          – binary: any prior emergency visit
+        - ``total_prior_utilization``  – sum of all prior visit counts
+        - ``specialty_known``          – binary: medical_specialty != "Missing"
+        - interaction features         – numeric column products (from config)
 
-    Features added (when source data is available):
-        - ``comorbidity_count``      – sum of binary comorbidity flags
-        - ``age_group``              – age discretised into labelled bins
-        - ``prior_admission_flag``   – binary indicator for any prior admission
-        - ``discharge_disposition_cat`` – simplified discharge grouping
+    The ``age`` string column is dropped after ordinal encoding since
+    ordinal encoding is more appropriate than OHE for ordered categories.
 
     Parameters
     ----------
@@ -42,15 +61,16 @@ def create_features(df: pd.DataFrame, config: dict) -> pd.DataFrame:
     Returns
     -------
     pd.DataFrame
-        DataFrame with new feature columns appended (original columns retained).
+        DataFrame with new feature columns appended (most original columns
+        retained; ``age`` is replaced by ``age_ordinal``).
     """
     df = df.copy()
     feat_cfg = config.get("features", {})
 
-    df = _add_comorbidity_count(df, feat_cfg)
-    df = _add_age_group(df, feat_cfg)
-    df = _add_prior_admission_flag(df, feat_cfg)
-    df = _add_discharge_disposition_group(df, feat_cfg)
+    df = _map_age_to_ordinal(df, feat_cfg)
+    df = _add_prior_utilization_flags(df, feat_cfg)
+    df = _add_total_utilization(df)
+    df = _add_specialty_known_flag(df, feat_cfg)
     df = _add_interaction_features(df, feat_cfg)
 
     logger.info("Feature engineering complete. Shape: %d rows × %d columns",
@@ -62,157 +82,102 @@ def create_features(df: pd.DataFrame, config: dict) -> pd.DataFrame:
 # Sub-routines
 # ---------------------------------------------------------------------------
 
-def _add_comorbidity_count(df: pd.DataFrame, feat_cfg: dict) -> pd.DataFrame:
-    """Sum binary comorbidity flag columns into a single ``comorbidity_count``.
+def _map_age_to_ordinal(df: pd.DataFrame, feat_cfg: dict) -> pd.DataFrame:
+    """Convert bracket age strings to an ordered integer (``age_ordinal``).
 
-    Expects ``feat_cfg['comorbidity_cols']`` to contain a list of column names
-    that are already binary (0/1).  If the list is empty the function attempts
-    to auto-detect columns whose names contain common comorbidity keywords.
+    The original ``age`` column is dropped: ordinal encoding captures the
+    ordering correctly, and OHE would discard it.
+
+    Configuration key: ``features.age_brackets`` — dict mapping bracket
+    string to integer rank (e.g. ``"[70-80)": 4``).
+
+    Unmapped values produce NaN with a warning; the column is cast to Int64
+    (nullable integer) to preserve the NaN without promoting to float.
     """
-    comorbidity_cols: list[str] = feat_cfg.get("comorbidity_cols", [])
+    age_map: dict = feat_cfg.get("age_brackets", {})
 
-    # Auto-detect only if a non-empty list was provided and all columns exist.
-    # If comorbidity_cols is empty, skip silently — the dataset may already
-    # include a composite score (e.g. Comorbidity_Index) that is more reliable
-    # than summing auto-detected columns.
-    if not comorbidity_cols:
-        logger.info(
-            "features.comorbidity_cols is empty — skipping 'comorbidity_count'. "
-            "Use Comorbidity_Index / Chronic_Disease_Count directly in modelling."
-        )
+    if "age" not in df.columns:
+        logger.warning("Column 'age' not found — skipping age_ordinal.")
         return df
 
-    available = [c for c in comorbidity_cols if c in df.columns]
-    missing = set(comorbidity_cols) - set(available)
-    if missing:
-        logger.warning("Comorbidity column(s) not found and will be skipped: %s", missing)
+    df["age_ordinal"] = df["age"].map(age_map)
+
+    n_unmapped = df["age_ordinal"].isna().sum()
+    if n_unmapped > 0:
+        unmapped_vals = df.loc[df["age_ordinal"].isna(), "age"].unique().tolist()
+        logger.warning(
+            "%d rows have unmapped age values: %s. "
+            "Add entries to features.age_brackets in config.yaml.",
+            n_unmapped, unmapped_vals,
+        )
+
+    df["age_ordinal"] = df["age_ordinal"].astype(float).astype(int)
+    df.drop(columns=["age"], inplace=True)
+    logger.info("Created 'age_ordinal' from 'age'; dropped original 'age' column.")
+    return df
+
+
+def _add_prior_utilization_flags(df: pd.DataFrame, feat_cfg: dict) -> pd.DataFrame:
+    """Binary flags for any prior utilization (``any_{col}``).
+
+    Binary flags are stronger predictors than raw counts for linear models
+    when counts are sparse.
+
+    Configuration key: ``features.prior_utilization_cols`` — list of column
+    names (e.g. ``["n_inpatient", "n_emergency"]``).
+    """
+    cols: list[str] = feat_cfg.get("prior_utilization_cols", ["n_inpatient", "n_emergency"])
+    created = []
+    for col in cols:
+        if col not in df.columns:
+            logger.warning("Prior utilization column '%s' not found — skipping.", col)
+            continue
+        flag_col = f"any_{col}"
+        df[flag_col] = (df[col] > 0).astype(int)
+        created.append(flag_col)
+
+    if created:
+        logger.info("Created prior utilization flag(s): %s", created)
+    return df
+
+
+def _add_total_utilization(df: pd.DataFrame) -> pd.DataFrame:
+    """Sum all prior visit counts into ``total_prior_utilization``.
+
+    Aggregates outpatient, inpatient, and emergency prior visits.
+    Only columns present in ``df`` are included.
+    """
+    util_cols = ["n_outpatient", "n_inpatient", "n_emergency"]
+    available = [c for c in util_cols if c in df.columns]
     if not available:
-        logger.warning("No comorbidity columns available — skipping 'comorbidity_count'.")
+        logger.warning("No prior utilization columns found — skipping total_prior_utilization.")
         return df
 
-    df["comorbidity_count"] = df[available].sum(axis=1)
-    logger.info("Created 'comorbidity_count' from %d column(s): %s",
-                len(available), available)
+    df["total_prior_utilization"] = df[available].sum(axis=1)
+    logger.info("Created 'total_prior_utilization' from %s", available)
     return df
 
 
-def _add_age_group(df: pd.DataFrame, feat_cfg: dict) -> pd.DataFrame:
-    """Discretise a numeric age column into labelled bins (``age_group``).
+def _add_specialty_known_flag(df: pd.DataFrame, feat_cfg: dict) -> pd.DataFrame:
+    """Binary flag: ``specialty_known`` = 1 if medical_specialty is not "Missing".
 
-    Configuration keys used:
-        - ``features.age_col``     – source column name (default: ``"age"``)
-        - ``features.age_bins``    – bin edges (default: [0, 18, 40, 65, 80, 120])
-        - ``features.age_labels``  – bin labels (must be len(bins) - 1)
+    49.5% of medical_specialty values in this dataset are the literal string
+    "Missing" (not NaN).  Making the missingness explicit as a binary feature
+    gives the model a clean signal without conflating it with imputed values.
+
+    The ``medical_specialty`` column itself is retained for OHE.
+
+    Configuration key: ``features.specialty_missing_value`` (default: "Missing").
     """
-    age_col: str = feat_cfg.get("age_col", "age")
-
-    if age_col not in df.columns:
-        logger.warning(
-            "Age column '%s' not found — skipping 'age_group'. "
-            "Set 'features.age_col' in config.yaml.",
-            age_col,
-        )
+    if "medical_specialty" not in df.columns:
+        logger.warning("Column 'medical_specialty' not found — skipping specialty_known.")
         return df
 
-    bins = feat_cfg.get("age_bins", [0, 18, 40, 65, 80, 120])
-    labels = feat_cfg.get("age_labels", ["<18", "18-39", "40-64", "65-79", "80+"])
-
-    df["age_group"] = pd.cut(
-        df[age_col],
-        bins=bins,
-        labels=labels,
-        right=False,
-        include_lowest=True,
-    )
-    logger.info("Created 'age_group' from column '%s'", age_col)
-    return df
-
-
-def _add_prior_admission_flag(df: pd.DataFrame, feat_cfg: dict) -> pd.DataFrame:
-    """Create a binary flag indicating whether a patient had any prior admission.
-
-    Configuration key used:
-        - ``features.prior_admissions_col`` – source column name (numeric count)
-
-    If the source column contains a numeric count of prior admissions, this
-    function adds ``prior_admission_flag`` (1 if count > 0, else 0).
-    """
-    col: str | None = feat_cfg.get("prior_admissions_col")
-
-    if col is None:
-        # Attempt auto-detection
-        candidates = [c for c in df.columns if "prior" in c.lower() and "admit" in c.lower()]
-        if candidates:
-            col = candidates[0]
-            logger.info("Auto-detected prior admissions column: '%s'", col)
-
-    if col is None or col not in df.columns:
-        logger.warning(
-            "Prior admissions column not found — skipping 'prior_admission_flag'. "
-            "Set 'features.prior_admissions_col' in config.yaml."
-        )
-        return df
-
-    df["prior_admission_flag"] = (df[col] > 0).astype(int)
-    logger.info("Created 'prior_admission_flag' from column '%s'", col)
-    return df
-
-
-def _add_discharge_disposition_group(df: pd.DataFrame, feat_cfg: dict) -> pd.DataFrame:
-    """Map granular discharge disposition codes/labels into broader groups.
-
-    Configuration key used:
-        - ``features.discharge_disposition_col`` – source column name
-
-    The mapping below covers typical CMS discharge disposition categories.
-    Adjust the ``DISPOSITION_MAP`` dict to match the actual dataset values.
-    """
-    col: str | None = feat_cfg.get("discharge_disposition_col")
-
-    if col is None:
-        # Attempt auto-detection
-        candidates = [c for c in df.columns if "discharge" in c.lower() or "disposition" in c.lower()]
-        if candidates:
-            col = candidates[0]
-            logger.info("Auto-detected discharge disposition column: '%s'", col)
-
-    if col is None or col not in df.columns:
-        logger.warning(
-            "Discharge disposition column not found — skipping grouping. "
-            "Set 'features.discharge_disposition_col' in config.yaml."
-        )
-        return df
-
-    # Mapping covers the current dataset values and common CMS equivalents.
-    # Add entries here as new datasets introduce different label conventions.
-    DISPOSITION_MAP: dict[str, str] = {
-        # Home
-        "home": "Home",
-        "home health": "Home",
-        "home with home health service": "Home",
-        # Facility (post-acute / institutional care)
-        "rehab": "Facility",
-        "inpatient rehabilitation": "Facility",
-        "nursing facility": "Facility",
-        "skilled nursing facility": "Facility",
-        "snf": "Facility",
-        "long term care hospital": "Facility",
-        "ltch": "Facility",
-        # AMA / Other
-        "ama": "AMA/Other",
-        "left against medical advice": "AMA/Other",
-        "expired": "AMA/Other",
-        "hospice": "AMA/Other",
-    }
-
-    raw_values = df[col].astype(str).str.strip().str.lower()
-    df["discharge_disposition_cat"] = raw_values.map(DISPOSITION_MAP).fillna("Other")
-
+    missing_val: str = feat_cfg.get("specialty_missing_value", "Missing")
+    df["specialty_known"] = (df["medical_specialty"] != missing_val).astype(int)
+    known_pct = df["specialty_known"].mean() * 100
     logger.info(
-        "Created 'discharge_disposition_cat' from column '%s'. "
-        "Group counts:\n%s",
-        col,
-        df["discharge_disposition_cat"].value_counts().to_string(),
+        "Created 'specialty_known': %.1f%% have a known specialty.", known_pct
     )
     return df
 
@@ -222,20 +187,10 @@ def _add_interaction_features(df: pd.DataFrame, feat_cfg: dict) -> pd.DataFrame:
 
     Configuration keys used (under ``features.interactions``):
         - ``enabled`` – bool flag to toggle all interactions on/off.
-        - ``terms``   – list of [col_a, col_b] pairs.  A column named
-          ``{col_a}_x_{col_b}`` is created for each pair.
+        - ``terms``   – list of [col_a, col_b] pairs. A column named
+          ``{col_a}_x_{col_b}`` is created for each valid pair.
 
-    Only pairs where both columns are present in ``df`` are created.
-    Non-numeric source columns raise a warning and are skipped.
-
-    Example config::
-
-        features:
-          interactions:
-            enabled: true
-            terms:
-              - ["Age", "Comorbidity_Index"]
-              - ["Severity_Score", "Length_of_Stay"]
+    Only pairs where both columns are present and numeric are created.
     """
     interaction_cfg = feat_cfg.get("interactions", {})
     if not interaction_cfg.get("enabled", False):

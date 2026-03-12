@@ -1,305 +1,243 @@
-# Hospital Readmission Risk — Final Project Report
+# Hospital Readmission Prediction — Project Report
 
-**Date:** 2026-03-10
-**Dataset:** `hospital_readmission_risk_dataset_2026_v1_18000rows.csv`
-**Pipeline status:** Complete (Phases 1–5)
-
----
-
-## 1. Pipeline Architecture
-
-```
-Raw CSV
-  └─ load_raw_data()           [data_preparation.py]
-       └─ clean_data()          clip, impute, dedup
-            └─ create_features() engineered features
-                 └─ encode_features()  OHE categorical columns
-                      └─ load_features()  drop leakage & redundant cols
-                           └─ make_splits()  60/20/20 stratified split
-                                ├─ build_baselines()
-                                ├─ tune_model()         RandomizedSearchCV
-                                ├─ calibrate_model()    Platt / isotonic
-                                └─ threshold_sweep()    F1-optimal threshold
-```
-
-**Key design decisions:**
-- OHE is separated from `clean_data()` so feature engineering sees raw categoricals
-- Logistic Regression wrapped in `StandardScaler → LR` Pipeline to prevent leakage in CV
-- Config-driven: all paths, hyperparameters, feature names in `config/config.yaml`
-- Figures organised into subfolders: `eda/`, `modeling/`, `tuning/`, `shap/`, `error_analysis/`
+**Dataset:** `hospital_readmissions.csv` | **Date:** 2026-03-11
+**Model:** Calibrated Gradient Boosting (sigmoid) | **Threshold:** 0.35 (recall-constrained)
 
 ---
 
-## 2. Dataset Characteristics
+## 1. Dataset
 
-| Property | Value |
+| Attribute | Value |
 |---|---|
-| Rows | 18,000 |
-| Columns (raw) | 25 |
-| Feature columns (post-OHE + engineering) | 43 |
-| Target | `Readmitted_Within_30_Days` |
-| Positive rate | 74.2% (readmitted) |
-| Missing values | None |
-| Numeric features | Age, Comorbidity_Index, Severity_Score, Length_of_Stay, Previous_Admissions_6M, Creatinine_Level, HbA1c_Level, Number_of_Medications, Chronic_Disease_Count |
-| Categorical features | Gender, Insurance_Type, Admission_Type, Primary_Diagnosis_Group, Discharge_Disposition |
-| Engineered features | `prior_admission_flag`, `age_group`, `discharge_disposition_cat`, `Age_x_Comorbidity_Index`, `Severity_Score_x_Length_of_Stay` |
-| Leakage columns excluded | `Followup_Appointment_Scheduled`, `Medication_Adherence_Score` |
+| Source file | `data/raw/hospital_readmissions.csv` |
+| Rows | 25,000 |
+| Raw columns | 17 |
+| Target column | `readmitted` (`yes` → 1, `no` → 0) |
+| Positive rate | 47.0% (11,754 / 25,000) — near-balanced |
 
-**Important note:** The dataset is synthetic — features were generated without real clinical relationships, so correlations with the target are near-zero. All model performance metrics reflect this.
+### Schema
+
+| Column | Type | Description |
+|---|---|---|
+| `age` | categorical | Age bracket string: `[40-50)` … `[90-100)` |
+| `time_in_hospital` | numeric | Days admitted (1–14) |
+| `n_lab_procedures` | numeric | Number of lab tests ordered |
+| `n_procedures` | numeric | Number of non-lab procedures |
+| `n_medications` | numeric | Number of medications administered |
+| `n_outpatient` | numeric | Prior outpatient visits |
+| `n_inpatient` | numeric | Prior inpatient admissions |
+| `n_emergency` | numeric | Prior emergency visits |
+| `medical_specialty` | categorical | Admitting specialty (49.5% are literal "Missing") |
+| `diag_1` / `diag_2` / `diag_3` | categorical | Primary and secondary diagnosis codes |
+| `glucose_test` | categorical | Glucose serum test result: no / normal / high |
+| `A1Ctest` | categorical | HbA1c test result: no / normal / high |
+| `change` | categorical | Medication change during stay: yes / no |
+| `diabetes_med` | categorical | Diabetes medication prescribed: yes / no |
+| `readmitted` | binary target | Readmitted within 30 days |
+
+No missing values in the raw dataset. No rows required imputation.
 
 ---
 
-## 3. Modeling Approach
+## 2. Pipeline
 
-### Baseline Models
+```
+load_raw_data → clean_data → create_features → encode_features
+```
 
-| Model | Preprocessing | Class balance |
+### Steps
+
+| Step | Function | Key actions |
 |---|---|---|
-| Logistic Regression | StandardScaler (Pipeline) | `class_weight="balanced"` |
-| Random Forest | None (scale-invariant) | `class_weight="balanced"` |
-| HistGradientBoosting | None (handles mixed types) | `class_weight="balanced"` |
+| Load | `load_raw_data` | Read CSV; raise on missing file |
+| Clean | `clean_data` | Map target (yes→1/no→0); drop duplicates; validate schema; median/mode imputation |
+| Feature engineering | `create_features` | Add 6 derived features (see below); drop raw `age` |
+| Encode | `encode_features` | OHE with `drop_first=True` on all categorical columns |
+
+### Engineered Features
+
+| Feature | Description |
+|---|---|
+| `age_ordinal` | Ordered integer from age bracket (1=40–50 … 6=90–100); replaces raw `age` |
+| `any_n_inpatient` | Binary: any prior inpatient admission |
+| `any_n_emergency` | Binary: any prior emergency visit |
+| `total_prior_utilization` | Sum of outpatient + inpatient + emergency prior visits |
+| `specialty_known` | Binary: `medical_specialty` ≠ "Missing" |
+| `n_inpatient_x_time_in_hospital` | Interaction: prior inpatient count × length of stay |
+| `n_medications_x_time_in_hospital` | Interaction: medication count × length of stay |
+
+**Final feature matrix:** 25,000 rows × 47 features (after OHE with `drop_first=True`).
+
+---
+
+## 3. Baseline Model Performance (Validation Set)
+
+Cross-validation on the training set (5-fold, ROC-AUC scoring), then full evaluation on the held-out validation set (5,000 rows).
+
+| Model | ROC-AUC | PR-AUC | Precision | Recall | F1 | Brier |
+|---|---|---|---|---|---|---|
+| **Gradient Boosting** | **0.6579** | **0.6351** | 0.5954 | 0.5776 | 0.5864 | 0.2305 |
+| Random Forest | 0.6563 | 0.6359 | 0.5978 | 0.5746 | 0.5860 | 0.2303 |
+| Logistic Regression | 0.6504 | 0.6276 | 0.6123 | 0.5287 | 0.5675 | 0.2320 |
+
+All metrics at default threshold (0.5). Gradient Boosting selected as best baseline by ROC-AUC.
+
+---
+
+## 4. Tuned Model Performance
 
 ### Hyperparameter Tuning
 
-- Method: `RandomizedSearchCV` with `StratifiedKFold` (5 folds, 20 iterations)
-- Scoring: ROC-AUC (cleaner signal than F1 on near-random signal)
-- Per-model search spaces defined in `config.yaml`
-
-**Best hyperparameters:**
-
-| Model | Best parameters |
-|---|---|
-| LogisticRegression | C=0.1, penalty=l1, solver=liblinear |
-| RandomForest | n_estimators=300, max_depth=5, min_samples_leaf=10, min_samples_split=5 |
-| GradientBoosting | learning_rate=0.01, max_iter=150, max_depth=6, min_samples_leaf=50 |
+`RandomizedSearchCV` (20 iterations, 5-fold CV, `roc_auc` scoring) on the training set for all three model families. Gradient Boosting remained the best performer on the validation set after tuning.
 
 ### Calibration
 
-- Method: Post-hoc calibration on validation set (Platt scaling vs isotonic regression)
-- Both methods compared; winner selected by Brier score
-- Implemented via `_PrefitCalibratedModel` wrapper (compatible with sklearn ≥ 1.6)
+Post-hoc probability calibration compared sigmoid vs. isotonic methods on a held-out 30% of the validation set:
 
-### Threshold Optimisation
-
-- Sweep: 0.05 → 0.95 in steps of 0.05
-- Objective: maximise F1
-- Optimal threshold: **0.05** (driven by 74% positive rate — model defaults to conservative positive prediction)
-
----
-
-## 4. Best Model & Performance
-
-**Best model:** Logistic Regression (tuned + calibrated)
-
-### Validation Set
-
-| Metric | Value |
+| Method | Brier score (held-out) |
 |---|---|
-| ROC-AUC | 0.574 |
-| PR-AUC | 0.781 |
-| F1 (at threshold=0.05) | 0.852 |
-| Recall | 1.000 |
-| Precision | 0.742 |
-| Specificity | 0.002 |
-| Brier Score | 0.189 |
+| **Sigmoid** | **0.2279** |
+| Isotonic | 0.2287 |
 
-### Test Set (held out, final evaluation)
+**Best calibration method: sigmoid.**
 
-| Metric | Value |
-|---|---|
-| ROC-AUC | 0.567 |
-| PR-AUC | 0.776 |
-| F1 | 0.852 |
-| Recall | 1.000 |
-| Precision | 0.742 |
-| Brier Score | 0.189 |
+Uncalibrated Brier: 0.2303 → Calibrated: 0.2296 (marginal improvement; probabilities were already reasonably calibrated).
 
-**Baseline comparison (val ROC-AUC):**
+### Threshold Selection
 
-| Model | Baseline | Tuned | Δ |
-|---|---|---|---|
-| LogisticRegression | 0.562 | 0.567 | +0.005 |
-| RandomForest | 0.552 | 0.553 | +0.001 |
-| GradientBoosting | 0.541 | 0.554 | +0.013 |
+Recall-constrained threshold sweep (range 0.05–0.95, step 0.05): find the highest-precision threshold where recall ≥ 0.80.
 
-Tuning gains are small — consistent with the synthetic dataset's near-zero signal.
+**Optimal threshold: 0.35**
+
+### Final Metrics
+
+| Split | ROC-AUC | PR-AUC | Precision | Recall | F1 | Specificity | Brier |
+|---|---|---|---|---|---|---|---|
+| Validation | 0.6578 | 0.6354 | 0.5119 | 0.8766 | 0.6464 | 0.2582 | 0.2296 |
+| **Test** | **0.6534** | **0.6233** | **0.5115** | **0.8792** | **0.6467** | **0.2548** | **0.2309** |
+
+Val and test metrics are consistent — no overfitting to the validation threshold.
+Recall constraint of ≥ 0.80 is satisfied on both splits (val: 0.877, test: 0.879).
 
 ---
 
-## 5. Most Important Predictive Features (SHAP)
+## 5. SHAP Feature Importance
 
-SHAP values computed using `TreeExplainer` (for tree models) and `LinearExplainer`
-(for LR) on 500 validation samples.
+SHAP values computed via `shap.PermutationExplainer` on 500 validation samples drawn from the full calibrated model (treats the calibration wrapper as a black box).
 
-**Top 10 features by mean |SHAP|** (from `shap/shap_bar_importance.png`):
+### Top Features (SHAP bar importance)
 
-> Because the dataset is synthetic, SHAP magnitudes are approximately equal
-> across all features (no single feature has meaningful predictive signal).
-> The following ranking reflects marginal differences:
-
-1. Severity_Score
-2. Chronic_Disease_Count
-3. Number_of_Medications
-4. High_Risk_Medication_Flag (if present)
-5. Comorbidity_Index
-6. Age
-7. Length_of_Stay
-8. Previous_Admissions_6M
-9. HbA1c_Level
-10. Age_x_Comorbidity_Index (interaction term)
-
-With real EHR data, features 1–4 would be expected to dominate in a genuine
-readmission risk model.
-
----
-
-## 6. Error Patterns
-
-At the optimal threshold (0.05), the model is highly sensitive (recall ≈ 1.0)
-but has near-zero specificity:
-
-| Group | Count | % |
+| Rank | Feature | Notes |
 |---|---|---|
-| TP (correctly predicted readmissions) | ~2,671 | ~74% |
-| TN (correctly predicted non-readmissions) | ~4 | ~0.1% |
-| FP (false alarms) | ~921 | ~26% |
-| FN (missed readmissions) | ~4 | ~0.1% |
+| 1 | `total_prior_utilization` | Engineered: sum of all prior visits — strongest single predictor |
+| 2 | `n_inpatient_x_time_in_hospital` | Interaction: high prior inpatient × long stay = highest risk |
+| 3 | `diabetes_med_yes` | Having diabetes medication is associated with increased readmission risk |
+| 4 | `age_ordinal` | Older patients have higher readmission risk |
 
-**False Positive profile vs False Negative profile:**
-- Because nearly all predictions are positive (threshold=0.05), FN are extremely rare
-- FP patients are drawn from the 26% true-negative pool — clinically, these would be
-  unnecessary intervention alerts
-- With real data and a higher-signal model, FP and FN profiles would differ meaningfully
-  on features like age, comorbidity, and diagnosis group
+SHAP dependence plots confirm real feature ranges (e.g., `time_in_hospital` spans 1–14 days as expected from the dataset schema).
 
 ---
 
-## 7. Dataset Limitations
+## 6. Error Analysis
 
-| Limitation | Impact |
-|---|---|
-| Synthetic data — features are independent | ROC-AUC ≈ 0.55 (near-chance); SHAP magnitudes near-uniform |
-| 74% positive rate (inverted imbalance) | No-skill PR-AUC = 0.74; high F1 achievable by always predicting positive |
-| Threshold collapses to 0.05 | With no discriminative signal, F1-optimal threshold = "predict everything positive" |
-| No temporal structure | Cannot evaluate stability over time or covariate shift |
-| No patient IDs | Cannot test same-patient repeated admissions |
+Error groups on the validation set (5,000 rows) at threshold = 0.35:
+
+| Group | N | % of val set |
+|---|---|---|
+| True Positive (TP) | 2,061 | 41.2% |
+| False Negative (FN) | 290 | 5.8% |
+| True Negative (TN) | 684 | 13.7% |
+| False Positive (FP) | 1,965 | 39.3% |
+
+The low threshold (0.35) deliberately accepts a high FP rate to maximise recall — consistent with the clinical priority of not missing genuine readmissions.
+
+### FP vs FN Profile
+
+| Feature | FP (mean) | FN (mean) | Interpretation |
+|---|---|---|---|
+| `age_ordinal` | 3.55 | lower | FP patients are older on average |
+| `time_in_hospital` | 4.59 | lower | FP patients have longer stays |
+| `n_medications` | 16.60 | lower | FP patients have more medications |
+| `total_prior_utilization` | high | very low | FN patients have near-zero prior utilisation — model misses low-history readmitters |
+
+**FN profile:** Patients the model misses tend to have little or no prior utilisation history, making them look low-risk despite actual readmission. This is the primary failure mode.
+
+---
+
+## 7. Limitations
+
+1. **Single dataset origin** — all 25,000 records come from a single source; generalisability to other institutions is unverified.
+2. **Calibration held-out evaluation only** — calibration was compared on a 30% held-out sub-split of the validation set, not via cross-validation. The sigmoid advantage over isotonic is small and may not generalise.
+3. **SHAP approximation** — `PermutationExplainer` is used because the calibration wrapper prevents TreeExplainer from accessing internal tree structure. SHAP values reflect the full model including the calibrator, which is correct but slightly slower and more approximate.
+4. **No temporal validation** — records are not ordered chronologically; temporal leakage cannot be ruled out if the dataset has temporal structure.
+5. **Low-history FN gap** — patients with no prior utilisation are systematically harder to identify (see Error Analysis §6).
 
 ---
 
 ## 8. Figures Index
 
-```
-reports/figures/
-├── eda/
-│   ├── categorical_distributions.png
-│   ├── class_distribution.png
-│   ├── correlation_matrix.png
-│   ├── features_vs_target.png
-│   ├── numeric_distributions.png
-│   ├── readmission_rate_by_category.png
-│   └── target_correlations.png
-├── modeling/
-│   ├── calibration_baselines.png
-│   ├── confusion_matrix_best_baseline.png
-│   ├── feature_importance_*.png
-│   ├── metrics_comparison_baselines.png
-│   ├── pr_curve_baselines.png
-│   ├── roc_curve_baselines.png
-│   └── roc_pr_curves_baselines.png
-├── tuning/
-│   ├── calibration_curve.png
-│   ├── confusion_matrix_calibrated_optimal.png
-│   ├── confusion_matrix_tuned_*.png  (×3)
-│   ├── pr_curve_tuned_models.png
-│   ├── roc_curve_tuned_models.png
-│   └── threshold_analysis.png
-├── shap/
-│   ├── shap_summary.png
-│   ├── shap_bar_importance.png
-│   ├── shap_dependence_*.png  (×4)
-│   └── shap_patient_example_*.png  (×3)
-└── error_analysis/
-    ├── error_age_comorbidity_scatter.png
-    ├── error_*_distribution.png  (×5)
-    ├── error_diagnosis_distribution.png
-    └── false_positive_vs_negative.png
-```
+### EDA (`reports/figures/eda/`)
 
----
-
-## 9. Saved Model Artifacts
-
-| File | Contents |
+| File | Description |
 |---|---|
-| `models/best_baseline_model.pkl` | `{name, model, feature_names}` for best baseline LR |
-| `models/best_tuned_model.pkl` | `{name, model, feature_names, threshold, val_metrics, test_metrics, best_params}` |
-| `data/processed/metrics_summary.csv` | Validation + test metrics for all 3 baseline models |
-| `data/processed/metrics_tuned_summary.csv` | Validation metrics for all 3 tuned models + test row |
+| `class_distribution.png` | Bar chart of readmitted vs. not readmitted counts |
+| `age_distribution.png` | Age bracket frequencies |
+| `numeric_distributions.png` | Histograms of all numeric features |
+| `prior_utilization_distributions.png` | Outpatient / inpatient / emergency visit distributions |
+| `categorical_distributions.png` | Bar charts for all categorical features |
+| `medical_specialty_distribution.png` | Top specialties (including "Missing" category) |
+| `correlation_matrix.png` | Pearson correlation heatmap (numeric features) |
+| `target_correlations.png` | Feature correlations with the readmitted target |
+| `features_vs_target.png` | Box plots of numeric features split by target |
+| `readmission_rate_by_category.png` | Readmission rate per level of each categorical feature |
 
----
+### Baseline Modeling (`reports/figures/modeling/`)
 
-## 10. Feedback Report
+| File | Description |
+|---|---|
+| `roc_curve_baselines.png` | ROC curves for all three baseline models |
+| `pr_curve_baselines.png` | Precision-Recall curves for all three baseline models |
+| `calibration_baselines.png` | Calibration curves (reliability diagrams) |
+| `confusion_matrix_best_baseline.png` | Confusion matrix for best baseline (GradientBoosting, threshold=0.5) |
+| `feature_importance_logisticregression.png` | Top-20 absolute coefficients for Logistic Regression |
+| `feature_importance_randomforest.png` | Top-20 Gini importances for Random Forest |
+| `metrics_comparison_baselines.png` | Bar chart comparing key metrics across all baselines |
 
-### Current Pipeline Weaknesses
+### Tuning & Calibration (`reports/figures/tuning/`)
 
-| Issue | Severity | Notes |
-|---|---|---|
-| Synthetic dataset — zero real signal | Critical | All metrics, importances, and error patterns are meaningless without real data |
-| Calibration on validation set | Moderate | Calibration should use a separate held-out set; val set used for both model selection and calibration introduces optimism bias |
-| No cross-dataset validation | Moderate | Model stability across hospitals, years, or patient populations is unknown |
-| SHAP linear explainer approximation | Low | For a calibrated LR, SHAP is approximated through the calibration layer — consider using raw LR for explanation |
-| No fairness audit | Moderate | Disparate impact across gender, insurance type, and age groups not evaluated |
-| Threshold=0.05 collapse | Low | Consequence of near-random signal; would not occur with real data |
+| File | Description |
+|---|---|
+| `roc_curve_tuned_models.png` | ROC curves for all tuned models |
+| `pr_curve_tuned_models.png` | Precision-Recall curves for all tuned models |
+| `confusion_matrix_tuned_logisticregression.png` | Confusion matrix for tuned Logistic Regression |
+| `confusion_matrix_tuned_randomforest.png` | Confusion matrix for tuned Random Forest |
+| `confusion_matrix_tuned_gradientboosting.png` | Confusion matrix for tuned Gradient Boosting |
+| `calibration_curve.png` | Sigmoid vs. isotonic calibration comparison |
+| `threshold_analysis.png` | Precision / Recall / F1 / Specificity vs. threshold sweep |
+| `confusion_matrix_calibrated_optimal.png` | Confusion matrix at optimal threshold (0.35) |
 
-### Improvements Possible with Real Hospital Data
+### SHAP Interpretation (`reports/figures/shap/`)
 
-1. **Feature engineering**
-   - ICD-10 / ICD-11 code grouping (Elixhauser or CCI comorbidity scores)
-   - Medication reconciliation: count, polypharmacy flags, drug-drug interactions
-   - Lab trend features: Δ(creatinine), Δ(HbA1c) over the past N days
-   - Social determinants: insurance gaps, distance from hospital, housing instability flags
+| File | Description |
+|---|---|
+| `shap_bar_importance.png` | Mean absolute SHAP values (global feature importance) |
+| `shap_summary.png` | Beeswarm plot: SHAP values coloured by feature value |
+| `shap_dependence_total_prior_utilization.png` | SHAP dependence for total prior utilisation |
+| `shap_dependence_n_inpatient_x_time_in_hospital.png` | SHAP dependence for inpatient × stay interaction |
+| `shap_dependence_diabetes_med_yes.png` | SHAP dependence for diabetes medication flag |
+| `shap_dependence_age_ordinal.png` | SHAP dependence for age ordinal |
+| `shap_patient_example_1.png` | Waterfall plot: individual patient explanation (example 1) |
+| `shap_patient_example_2.png` | Waterfall plot: individual patient explanation (example 2) |
+| `shap_patient_example_3.png` | Waterfall plot: individual patient explanation (example 3) |
 
-2. **Modelling**
-   - XGBoost / LightGBM: handles categorical natively, faster SHAP
-   - Temporal models (LSTM, Transformer): patient history sequences
-   - Multi-task learning: predict LOS + readmission jointly
-   - Ensemble stacking: combine LR (good calibration) with tree model (good discrimination)
+### Error Analysis (`reports/figures/error_analysis/`)
 
-3. **Calibration**
-   - Use a dedicated third split (train / calibration / test) to avoid leakage
-   - Platt scaling is preferred over isotonic when calibration set is small
-
-4. **Evaluation**
-   - Decision-curve analysis (DCA): net benefit vs. treat-all at varying thresholds
-   - Subgroup analysis: stratify metrics by age group, diagnosis, insurance type
-   - Time-split validation: train on 2022–2024 data, test on 2025 data
-
-5. **Fairness**
-   - Demographic parity, equalised odds, and individual fairness audits
-   - Counterfactual analysis: would changing insurance type alter prediction?
-
-### Production Deployment Steps
-
-1. **Model serving**
-   - Wrap `best_tuned_model.pkl` in a REST endpoint (FastAPI / Flask)
-   - Input: patient JSON matching the 43-feature schema
-   - Output: `{"readmission_probability": 0.72, "risk_tier": "high", "threshold": 0.35}`
-
-2. **Data pipeline**
-   - Replace CSV ingestion with an EHR connector (HL7 FHIR, EPIC API)
-   - Schedule daily batch scoring + real-time on-discharge scoring
-
-3. **Monitoring**
-   - Track prediction distribution over time (PSI — population stability index)
-   - Alert when ROC-AUC on recent labelled cases drops below threshold
-   - Log feature distributions to detect covariate shift
-
-4. **Clinical integration**
-   - Dashboard: flag high-risk patients for care coordinator follow-up
-   - Integrate SHAP explanations ("Top 3 risk factors for this patient")
-   - Feedback loop: record which flagged patients were actually re-admitted
-
-5. **Governance**
-   - Model card documenting intended use, limitations, and fairness evaluation
-   - IRB approval if using de-identified patient data for model development
-   - Periodic re-training schedule (quarterly or when performance degrades)
+| File | Description |
+|---|---|
+| `error_age_ordinal_distribution.png` | Age distribution across TP/TN/FP/FN groups |
+| `error_time_in_hospital_distribution.png` | Length-of-stay distribution across error groups |
+| `error_n_medications_distribution.png` | Medication count distribution across error groups |
+| `error_n_inpatient_distribution.png` | Prior inpatient count distribution across error groups |
+| `error_total_prior_utilization_distribution.png` | Total prior utilisation distribution across error groups |
+| `false_positive_vs_negative.png` | FP vs. FN feature comparison (mean values) |
+| `error_age_utilization_scatter.png` | Scatter plot of age vs. prior utilisation coloured by error group |

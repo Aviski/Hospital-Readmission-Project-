@@ -53,36 +53,9 @@ def _err_dir(config: dict) -> Path:
     return _figs(config, "error_analysis")
 
 
-def _inner_model(model: Any) -> Any:
-    """Unwrap a Pipeline to the core estimator for SHAP."""
-    from sklearn.pipeline import Pipeline
-    if isinstance(model, Pipeline):
-        return model.steps[-1][1]
-    # Also unwrap _PrefitCalibratedModel from modeling.py
-    if hasattr(model, "base_model"):
-        inner = model.base_model
-        if isinstance(inner, Pipeline):
-            return inner.steps[-1][1]
-        return inner
-    return model
-
-
-def _transform_X(model: Any, X: pd.DataFrame) -> pd.DataFrame:
-    """Apply Pipeline preprocessing steps (e.g. StandardScaler) to X.
-
-    Returns the transformed matrix that the final estimator actually sees.
-    If ``model`` is not a Pipeline (or has no preprocessing), returns ``X``
-    unchanged.
-    """
-    from sklearn.pipeline import Pipeline
-    base = model
-    if hasattr(model, "base_model"):
-        base = model.base_model
-    if isinstance(base, Pipeline) and len(base.steps) > 1:
-        preprocessor = Pipeline(base.steps[:-1])
-        X_t = preprocessor.transform(X)
-        return pd.DataFrame(X_t, columns=X.columns, index=X.index)
-    return X
+def _predict_proba_pos(model: Any, X: np.ndarray, feature_names: list[str]) -> np.ndarray:
+    """Wrapper: call model.predict_proba on a numpy array, return P(positive)."""
+    return model.predict_proba(pd.DataFrame(X, columns=feature_names))[:, 1]
 
 
 # ---------------------------------------------------------------------------
@@ -95,17 +68,19 @@ def compute_shap_values(
     config: dict,
     max_samples: int = 500,
 ) -> tuple[Any, pd.DataFrame]:
-    """Compute SHAP values for the best-fit model.
+    """Compute SHAP values for the full calibrated model using unscaled features.
 
-    Uses ``TreeExplainer`` for tree-based models and ``LinearExplainer``
-    for linear models; falls back to ``KernelExplainer`` for other types.
+    Uses model-agnostic ``shap.Explainer`` which calls ``model.predict_proba``
+    directly — explaining the complete pipeline including any calibration layer.
+    Feature values in SHAP plots reflect the original (unscaled) input space
+    since the model itself handles scaling internally.
 
     Parameters
     ----------
     model       : fitted estimator or ``_PrefitCalibratedModel``.
-    X           : feature DataFrame (pre-OHE, as passed to the model).
+    X           : feature DataFrame in original (unscaled) space.
     config      : parsed config dict.
-    max_samples : for ``KernelExplainer``, limit background samples for speed.
+    max_samples : number of samples used for both background and explanation.
 
     Returns
     -------
@@ -115,68 +90,31 @@ def compute_shap_values(
     """
     import shap
 
-    seed        = config.get("random_seed", 42)
-    inner       = _inner_model(model)
-    X_t         = _transform_X(model, X)
+    seed         = config.get("random_seed", 42)
+    feature_names = list(X.columns)
 
-    n           = min(max_samples, len(X))
-    rng         = np.random.default_rng(seed)
-    idx         = rng.choice(len(X), size=n, replace=False)
-    X_sample    = X.iloc[idx].copy()
-    X_t_sample  = X_t.iloc[idx].copy()
+    n        = min(max_samples, len(X))
+    rng      = np.random.default_rng(seed)
+    idx      = rng.choice(len(X), size=n, replace=False)
+    X_sample = X.iloc[idx].copy()
 
-    logger.info("Computing SHAP values for %d samples (model: %s)...",
-                n, type(inner).__name__)
+    logger.info("Computing SHAP values for %d samples via model-agnostic Explainer...", n)
+
+    background = shap.sample(X_sample, min(100, n), random_state=seed)
+    predict_fn = lambda x: _predict_proba_pos(model, x, feature_names)
 
     try:
-        if hasattr(inner, "feature_importances_"):          # tree model
-            explainer   = shap.TreeExplainer(inner)
-            raw         = explainer.shap_values(X_t_sample)
-            # For binary classifiers raw may be a list [neg, pos]
-            if isinstance(raw, list) and len(raw) == 2:
-                vals = raw[1]
-            else:
-                vals = raw
-            shap_values = shap.Explanation(
-                values          = vals,
-                base_values     = (explainer.expected_value[1]
-                                   if isinstance(explainer.expected_value, list)
-                                   else explainer.expected_value),
-                data            = X_t_sample.values,
-                feature_names   = list(X_t_sample.columns),
-            )
+        explainer   = shap.Explainer(predict_fn, background, feature_names=feature_names)
+        shap_values = explainer(X_sample)
 
-        elif hasattr(inner, "coef_"):                       # linear model
-            explainer   = shap.LinearExplainer(inner, X_t_sample)
-            shap_values = explainer(X_t_sample)
-
-        else:                                               # fallback
-            logger.info("Using KernelExplainer (may be slow).")
-            predict_fn  = lambda x: model.predict_proba(
-                pd.DataFrame(x, columns=X_t_sample.columns))[:, 1]
-            bg          = shap.sample(X_t_sample, min(100, n))
-            explainer   = shap.KernelExplainer(predict_fn, bg)
-            vals        = explainer.shap_values(X_t_sample)
-            shap_values = shap.Explanation(
-                values          = vals,
-                base_values     = explainer.expected_value,
-                data            = X_t_sample.values,
-                feature_names   = list(X_t_sample.columns),
-            )
-
-    except Exception as exc:
-        logger.warning("SHAP TreeExplainer failed (%s); falling back to KernelExplainer.", exc)
-        predict_fn  = lambda x: model.predict_proba(
-            pd.DataFrame(x, columns=X_t_sample.columns))[:, 1]
-        bg          = shap.sample(X_t_sample, min(100, n))
-        explainer   = shap.KernelExplainer(predict_fn, bg, seed=seed)
-        vals        = explainer.shap_values(X_t_sample)
-        shap_values = shap.Explanation(
-            values          = vals,
-            base_values     = explainer.expected_value,
-            data            = X_t_sample.values,
-            feature_names   = list(X_t_sample.columns),
+    except (ValueError, TypeError, ImportError) as exc:
+        logger.warning(
+            "shap.Explainer failed (%s: %s). Falling back to PermutationExplainer.",
+            type(exc).__name__, exc,
         )
+        explainer   = shap.PermutationExplainer(predict_fn, background,
+                                                feature_names=feature_names)
+        shap_values = explainer(X_sample)
 
     logger.info("SHAP values computed. Shape: %s", shap_values.values.shape)
     return shap_values, X_sample
@@ -331,9 +269,9 @@ def summarise_errors(
     pd.DataFrame with rows = error groups, columns = mean numeric stats.
     """
     AUTO_COLS = [
-        "Age", "Comorbidity_Index", "Chronic_Disease_Count",
-        "Severity_Score", "Length_of_Stay", "Previous_Admissions_6M",
-        "HbA1c_Level", "Number_of_Medications",
+        "age_ordinal", "time_in_hospital", "n_medications",
+        "n_lab_procedures", "n_inpatient", "n_emergency",
+        "total_prior_utilization",
     ]
     if numeric_cols is None:
         numeric_cols = [c for c in AUTO_COLS if c in df_original.columns]
@@ -358,8 +296,8 @@ def plot_error_distributions(
 ) -> None:
     """Violin plots comparing key numeric features across FP / FN / TP / TN."""
     AUTO_COLS = [
-        "Age", "Comorbidity_Index", "Severity_Score",
-        "Length_of_Stay", "Previous_Admissions_6M",
+        "age_ordinal", "time_in_hospital", "n_medications",
+        "n_inpatient", "total_prior_utilization",
     ]
     plot_cols = [c for c in AUTO_COLS if c in df_original.columns]
     if not plot_cols:
@@ -395,15 +333,17 @@ def plot_error_distributions(
         logger.info("Saved error distribution (%s) → %s", col, out)
 
 
-def plot_error_age_comorbidity(
+def plot_error_utilization_scatter(
     groups: dict[str, pd.Index],
     df_original: pd.DataFrame,
     config: dict,
 ) -> None:
-    """Scatter plot of Age vs Comorbidity_Index coloured by error group."""
-    needed = {"Age", "Comorbidity_Index"}
+    """Scatter plot of age_ordinal vs total_prior_utilization coloured by error group."""
+    needed = {"age_ordinal", "total_prior_utilization"}
     if not needed.issubset(df_original.columns):
-        logger.warning("Age or Comorbidity_Index not in df — skipping scatter plot.")
+        logger.warning(
+            "age_ordinal or total_prior_utilization not in df — skipping scatter plot."
+        )
         return
 
     records = []
@@ -411,7 +351,7 @@ def plot_error_age_comorbidity(
                "FP": "tomato",    "FN": "darkorange"}
 
     for name, idx in groups.items():
-        sub = df_original.loc[idx, ["Age", "Comorbidity_Index"]]
+        sub = df_original.loc[idx, ["age_ordinal", "total_prior_utilization"]]
         sub = sub.assign(group=name)
         records.append(sub)
 
@@ -420,17 +360,17 @@ def plot_error_age_comorbidity(
     fig, ax = plt.subplots(figsize=(9, 6))
     for grp, color in palette.items():
         sub = combined[combined["group"] == grp]
-        ax.scatter(sub["Age"], sub["Comorbidity_Index"],
+        ax.scatter(sub["age_ordinal"], sub["total_prior_utilization"],
                    c=color, label=grp, alpha=0.4, s=15)
-    ax.set(xlabel="Age", ylabel="Comorbidity Index",
-           title="Age vs Comorbidity Index — coloured by prediction group")
+    ax.set(xlabel="Age (ordinal)", ylabel="Total Prior Utilization",
+           title="Age vs Prior Utilization — coloured by prediction group")
     ax.legend(title="Group", fontsize=9)
 
-    out = _err_dir(config) / "error_age_comorbidity_scatter.png"
+    out = _err_dir(config) / "error_age_utilization_scatter.png"
     fig.tight_layout()
     fig.savefig(out, dpi=150, bbox_inches="tight")
     plt.close(fig)
-    logger.info("Saved age-comorbidity scatter → %s", out)
+    logger.info("Saved age-utilization scatter → %s", out)
 
 
 def plot_false_positive_vs_negative(
@@ -440,8 +380,9 @@ def plot_false_positive_vs_negative(
 ) -> None:
     """Side-by-side bar chart: FP vs FN mean statistics for key numeric features."""
     AUTO_COLS = [
-        "Age", "Comorbidity_Index", "Severity_Score",
-        "Length_of_Stay", "Previous_Admissions_6M", "Number_of_Medications",
+        "age_ordinal", "time_in_hospital", "n_medications",
+        "n_lab_procedures", "n_inpatient", "n_emergency",
+        "total_prior_utilization",
     ]
     plot_cols = [c for c in AUTO_COLS if c in df_original.columns]
     if not plot_cols:
@@ -483,9 +424,9 @@ def plot_error_diagnosis_distribution(
     groups: dict[str, pd.Index],
     df_original: pd.DataFrame,
     config: dict,
-    diag_col: str = "Primary_Diagnosis_Group",
+    diag_col: str = "diag_1",
 ) -> None:
-    """Stacked bar: diagnosis group distribution for FP and FN."""
+    """Stacked bar: primary diagnosis distribution for FP and FN."""
     if diag_col not in df_original.columns:
         logger.warning("'%s' not in df — skipping diagnosis plot.", diag_col)
         return
@@ -500,7 +441,7 @@ def plot_error_diagnosis_distribution(
 
     fig, ax = plt.subplots(figsize=(10, 5))
     combined.plot.bar(ax=ax, color=["tomato", "darkorange"], width=0.7)
-    ax.set(title=f"Diagnosis distribution — FP vs FN ({diag_col})",
+    ax.set(title=f"Primary diagnosis distribution — FP vs FN ({diag_col})",
            ylabel="Proportion", xlabel="")
     ax.tick_params(axis="x", rotation=30)
     ax.legend(title="Error type")

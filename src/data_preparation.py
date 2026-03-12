@@ -4,7 +4,7 @@ data_preparation.py — Loading, cleaning, and basic validation of the raw datas
 Public API
 ----------
     load_raw_data(path)          – read a CSV into a DataFrame
-    clean_data(df, config)       – impute, clip, and validate (no encoding)
+    clean_data(df, config)       – map target, impute, validate
     encode_features(df, config)  – one-hot encode categorical columns
 
 Pipeline order
@@ -69,12 +69,15 @@ def clean_data(df: pd.DataFrame, config: dict) -> pd.DataFrame:
     """Clean a raw DataFrame according to the project configuration.
 
     Steps performed:
+        0. Map target column from string to binary (yes→1, no→0).
         1. Drop columns listed in ``config['data']['drop_columns']``.
         2. Remove fully-duplicate rows.
-        3. Validate that the target column is present and binary.
-        4. Clip physically-impossible numeric values (``config['data']['clip_values']``).
-        5. Impute missing numeric values with the column median.
-        6. Impute missing categorical values with ``config['data']['categorical_impute_value']``.
+        3. Validate schema: required columns present, target is 0/1.
+        4. Impute missing numeric values with the column median.
+        5. Impute missing categorical values (object/category dtype) with
+           the column mode.  NOTE: the string "Missing" in medical_specialty
+           is a valid category — it is NOT treated as NaN.
+        6. Post-imputation validation: raise if any missing values remain.
 
     One-hot encoding is intentionally NOT performed here so that
     ``create_features`` (feature engineering) has access to the original
@@ -95,6 +98,17 @@ def clean_data(df: pd.DataFrame, config: dict) -> pd.DataFrame:
     """
     df = df.copy()
     data_cfg = config.get("data", {})
+    target = data_cfg.get("target_column", "readmitted")
+
+    # ------------------------------------------------------------------
+    # 0. Map target from string to binary
+    # ------------------------------------------------------------------
+    if target in df.columns and not pd.api.types.is_numeric_dtype(df[target]):
+        pos_val = data_cfg.get("target_positive_value", "yes")
+        df[target] = (df[target].str.lower() == pos_val.lower()).astype(int)
+        logger.info(
+            "Mapped target '%s': '%s'→1, others→0", target, pos_val
+        )
 
     # ------------------------------------------------------------------
     # 1. Drop unwanted columns
@@ -114,30 +128,12 @@ def clean_data(df: pd.DataFrame, config: dict) -> pd.DataFrame:
         logger.info("Removed %d duplicate rows", n_dropped)
 
     # ------------------------------------------------------------------
-    # 3. Basic validation
+    # 3. Schema validation
     # ------------------------------------------------------------------
-    target = data_cfg.get("target_column", "readmitted_30d")
-    _validate(df, target)
+    _validate(df, target, config)
 
     # ------------------------------------------------------------------
-    # 4. Clip physically-impossible values
-    # ------------------------------------------------------------------
-    clip_cfg: dict = data_cfg.get("clip_values", {})
-    for col, bounds in clip_cfg.items():
-        if col not in df.columns:
-            logger.warning("clip_values: column '%s' not found — skipping.", col)
-            continue
-        lo, hi = bounds[0], bounds[1]
-        n_clipped = (
-            (lo is not None and df[col] < lo) | (hi is not None and df[col] > hi)
-        ).sum()
-        if n_clipped:
-            df[col] = df[col].clip(lower=lo, upper=hi)
-            logger.info("Clipped %d out-of-range values in '%s' to [%s, %s]",
-                        n_clipped, col, lo, hi)
-
-    # ------------------------------------------------------------------
-    # 5. Impute numeric columns with median
+    # 4. Impute numeric columns with median
     # ------------------------------------------------------------------
     numeric_cols = [
         c for c in df.select_dtypes(include="number").columns
@@ -148,23 +144,39 @@ def clean_data(df: pd.DataFrame, config: dict) -> pd.DataFrame:
         logger.info("Imputing %d numeric column(s) with median: %s",
                     len(missing_numeric), list(missing_numeric.keys()))
         for col in missing_numeric:
-            df[col].fillna(df[col].median(), inplace=True)
+            df[col] = df[col].fillna(df[col].median())
     else:
         logger.info("No missing numeric values — imputation skipped.")
 
     # ------------------------------------------------------------------
-    # 6. Impute categorical columns with a placeholder string
+    # 5. Impute categorical columns with mode (never imputes "Missing")
     # ------------------------------------------------------------------
-    cat_fill = data_cfg.get("categorical_impute_value", "Unknown")
-    cat_cols = df.select_dtypes(include=["object", "category"]).columns.tolist()
+    cat_cols = [
+        c for c in df.select_dtypes(include=["object", "category"]).columns
+        if c != target
+    ]
     missing_cat = {c: df[c].isna().sum() for c in cat_cols if df[c].isna().any()}
     if missing_cat:
-        logger.info("Imputing %d categorical column(s) with '%s': %s",
-                    len(missing_cat), cat_fill, list(missing_cat.keys()))
+        logger.info("Imputing %d categorical column(s) with mode: %s",
+                    len(missing_cat), list(missing_cat.keys()))
         for col in missing_cat:
-            df[col].fillna(cat_fill, inplace=True)
+            mode_val = df[col].mode()[0]
+            df[col] = df[col].fillna(mode_val)
     else:
         logger.info("No missing categorical values — imputation skipped.")
+
+    # ------------------------------------------------------------------
+    # 6. Post-imputation validation
+    # ------------------------------------------------------------------
+    still_missing = df.isna().sum().sum()
+    if still_missing > 0:
+        raise ValueError(
+            f"Imputation incomplete — {still_missing} missing values remain."
+        )
+
+    remaining_obj = df.select_dtypes(include=["object", "category"]).columns.tolist()
+    if remaining_obj:
+        logger.info("Categorical columns to be OHE'd: %s", remaining_obj)
 
     logger.info("Cleaning complete. Shape: %d rows × %d columns", df.shape[0], df.shape[1])
     return df
@@ -179,7 +191,10 @@ def encode_features(df: pd.DataFrame, config: dict) -> pd.DataFrame:
 
     This step is intentionally separated from ``clean_data`` so that
     ``create_features`` always operates on data that still contains the
-    original categorical columns (e.g. Discharge_Disposition).
+    original categorical columns.
+
+    Uses ``drop_first=True`` on both passes to remove reference categories
+    and avoid perfect multicollinearity in linear models.
 
     Parameters
     ----------
@@ -196,7 +211,7 @@ def encode_features(df: pd.DataFrame, config: dict) -> pd.DataFrame:
         scikit-learn and serialisation formats.
     """
     data_cfg = config.get("data", {})
-    target = data_cfg.get("target_column", "readmitted_30d")
+    target = data_cfg.get("target_column", "readmitted")
 
     # First pass: explicitly configured columns (if any)
     explicit_cols: list[str] = data_cfg.get("categorical_columns", [])
@@ -204,22 +219,32 @@ def encode_features(df: pd.DataFrame, config: dict) -> pd.DataFrame:
 
     if explicit_cols:
         logger.info("One-hot encoding configured column(s): %s", explicit_cols)
-        df = pd.get_dummies(df, columns=explicit_cols, drop_first=False)
+        df = pd.get_dummies(df, columns=explicit_cols, drop_first=True)
 
     # Second pass: any remaining object/category columns not yet encoded
-    # (e.g. discharge_disposition_cat added by feature engineering)
+    # (e.g. columns created by feature engineering)
     remaining_cat = [
         c for c in df.select_dtypes(include=["object", "category"]).columns
         if c != target
     ]
     if remaining_cat:
         logger.info("One-hot encoding remaining categorical column(s): %s", remaining_cat)
-        df = pd.get_dummies(df, columns=remaining_cat, drop_first=False)
+        df = pd.get_dummies(df, columns=remaining_cat, drop_first=True)
 
     # Cast bool dummies to int8 for sklearn compatibility
     bool_cols = df.select_dtypes(include="bool").columns.tolist()
     if bool_cols:
         df[bool_cols] = df[bool_cols].astype("int8")
+
+    # Post-encoding validation
+    remaining_after = [
+        c for c in df.select_dtypes(["object", "category"]).columns
+        if c != target
+    ]
+    if remaining_after:
+        raise ValueError(
+            f"Encoding incomplete — categorical columns remain: {remaining_after}"
+        )
 
     logger.info("Encoding complete. Shape: %d rows × %d columns", df.shape[0], df.shape[1])
     return df
@@ -229,30 +254,42 @@ def encode_features(df: pd.DataFrame, config: dict) -> pd.DataFrame:
 # Internal helpers
 # ---------------------------------------------------------------------------
 
-def _validate(df: pd.DataFrame, target: str) -> None:
-    """Run basic sanity checks and log warnings for any issues found."""
+def _validate(df: pd.DataFrame, target: str, config: dict) -> None:
+    """Validate schema and raise on critical failures."""
+    data_cfg = config.get("data", {})
+    required = data_cfg.get("required_columns", [])
+
+    # Schema check — raise on missing required columns
+    missing_cols = [c for c in required if c not in df.columns]
+    if missing_cols:
+        raise ValueError(
+            f"Schema mismatch — required columns not found: {missing_cols}"
+        )
+
+    # Target presence
     if target not in df.columns:
-        logger.warning(
-            "Target column '%s' not found in dataset. "
-            "Available columns: %s",
-            target,
-            df.columns.tolist(),
-        )
-        return
-
-    # Target should be binary (0 / 1)
-    unique_vals = df[target].dropna().unique()
-    if set(map(int, unique_vals)) - {0, 1}:
-        logger.warning(
-            "Target column '%s' contains unexpected values: %s. "
-            "Expected binary 0/1.",
-            target,
-            unique_vals,
+        raise ValueError(
+            f"Target column '{target}' not found in dataset. "
+            f"Available columns: {df.columns.tolist()}"
         )
 
+    # Target must be binary 0/1 after mapping
+    unique_vals = set(df[target].dropna().unique())
+    if not unique_vals.issubset({0, 1}):
+        raise ValueError(
+            f"Target '{target}' must contain only 0/1 after mapping. "
+            f"Found: {unique_vals}"
+        )
+
+    # Duplicate warning
+    n_dups = df.duplicated().sum()
+    if n_dups > 0:
+        logger.warning("%d duplicate rows found.", n_dups)
+
+    # Class balance info
     rate = df[target].mean()
     logger.info(
-        "Readmission rate: %.1f%%  (%d positive / %d total)",
+        "Class balance — positive rate: %.1f%%  (%d / %d)",
         rate * 100, int(df[target].sum()), len(df),
     )
 

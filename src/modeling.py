@@ -59,18 +59,9 @@ from sklearn.model_selection import (
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 
-from src.utils import get_logger, save_model
+from src.utils import get_logger
 
 logger = get_logger(__name__)
-
-# XGBoost is optional
-try:
-    import xgboost as xgb  # type: ignore
-    _XGBOOST_AVAILABLE = True
-    logger.info("XGBoost detected.")
-except ImportError:
-    _XGBOOST_AVAILABLE = False
-    logger.info("XGBoost not installed — using HistGradientBoostingClassifier.")
 
 
 # ---------------------------------------------------------------------------
@@ -227,6 +218,9 @@ def build_baselines(config: dict) -> dict[str, Any]:
     data leakage.  Tree-based models (RF, HGBC) are scale-invariant and are
     returned unwrapped.
 
+    Gradient Boosting uses sklearn's ``HistGradientBoostingClassifier``.
+    XGBoost and LightGBM are NOT dependencies of this project.
+
     Returns
     -------
     dict mapping model name → unfitted sklearn-compatible estimator.
@@ -260,34 +254,20 @@ def build_baselines(config: dict) -> dict[str, Any]:
         random_state=seed,
     )
 
-    # Gradient Boosting
-    if _XGBOOST_AVAILABLE:
-        gb = xgb.XGBClassifier(
-            n_estimators=gb_cfg.get("n_estimators", 200),
-            learning_rate=gb_cfg.get("learning_rate", 0.05),
-            max_depth=gb_cfg.get("max_depth", 6),
-            subsample=gb_cfg.get("subsample", 0.8),
-            colsample_bytree=gb_cfg.get("colsample_bytree", 0.8),
-            scale_pos_weight=gb_cfg.get("scale_pos_weight", 0.35),
-            eval_metric="logloss",
-            random_state=seed,
-        )
-        gb_name = "XGBoost"
-    else:
-        gb = HistGradientBoostingClassifier(
-            max_iter=gb_cfg.get("max_iter", 200),
-            learning_rate=gb_cfg.get("learning_rate", 0.05),
-            max_depth=gb_cfg.get("max_depth", 6),
-            min_samples_leaf=gb_cfg.get("min_samples_leaf", 20),
-            class_weight=gb_cfg.get("class_weight", "balanced"),
-            random_state=seed,
-        )
-        gb_name = "GradientBoosting"
+    # Gradient Boosting — sklearn HistGradientBoostingClassifier
+    gb = HistGradientBoostingClassifier(
+        max_iter=gb_cfg.get("max_iter", 200),
+        learning_rate=gb_cfg.get("learning_rate", 0.05),
+        max_depth=gb_cfg.get("max_depth", 5),
+        min_samples_leaf=gb_cfg.get("min_samples_leaf", 20),
+        class_weight=gb_cfg.get("class_weight", "balanced"),
+        random_state=seed,
+    )
 
     models = {
         "LogisticRegression": logit_pipeline,
         "RandomForest":       rf,
-        gb_name:              gb,
+        "GradientBoosting":   gb,
     }
     logger.info("Baseline estimators: %s", list(models.keys()))
     return models
@@ -689,9 +669,9 @@ def calibrate_model(
 ) -> "_PrefitCalibratedModel":
     """Compare sigmoid and isotonic calibration; return the better method.
 
-    Both calibrators are fitted on the raw probability outputs of the
-    already-fitted ``model`` (prefit semantics — base-model weights are
-    frozen).  The method with the lower Brier score on ``X_calib`` is kept.
+    Both calibrators are fitted on a 70% sub-split of the calibration set.
+    Brier scores are evaluated on the held-out 30% to avoid self-referential
+    comparison (fitting and evaluating on the same data).
 
     Parameters
     ----------
@@ -706,36 +686,44 @@ def calibrate_model(
     """
     cal_cfg = config.get("model", {}).get("calibration", {})
     methods = cal_cfg.get("methods", ["sigmoid", "isotonic"])
+    seed    = config.get("random_seed", 42)
+
+    # 70/30 sub-split: fit calibrator on X_calib_fit, evaluate on X_calib_eval
+    X_calib_fit, X_calib_eval, y_calib_fit, y_calib_eval = train_test_split(
+        X_calib, y_calib, test_size=0.30, random_state=seed, stratify=y_calib
+    )
 
     results: dict[str, tuple["_PrefitCalibratedModel", float]] = {}
     for method in methods:
-        cal_model = _fit_prefit_calibrator(model, X_calib, y_calib, method)
-        brier = brier_score_loss(y_calib, cal_model.predict_proba(X_calib)[:, 1])
+        cal_model = _fit_prefit_calibrator(model, X_calib_fit, y_calib_fit, method)
+        brier = brier_score_loss(y_calib_eval, cal_model.predict_proba(X_calib_eval)[:, 1])
         results[method] = (cal_model, brier)
-        logger.info("Calibration (%s): Brier=%.4f", method, brier)
+        logger.info("Calibration (%s): Brier=%.4f (held-out eval)", method, brier)
 
     best_method = min(results, key=lambda m: results[m][1])
     logger.info("Best calibration method: %s", best_method)
-    best_cal = results[best_method][0]
+
+    # Refit best calibrator on full calibration set
+    best_cal = _fit_prefit_calibrator(model, X_calib, y_calib, best_method)
 
     if save_plot:
         fig, ax = plt.subplots(figsize=(7, 6))
         palette = sns.color_palette("tab10", len(results) + 1)
 
-        # Uncalibrated reliability curve (manual — avoids sklearn API issues)
-        raw_prob = model.predict_proba(X_calib)[:, 1]
-        frac_pos, mean_pred = calibration_curve(y_calib, raw_prob, n_bins=10)
+        # Uncalibrated reliability curve
+        raw_prob = model.predict_proba(X_calib_eval)[:, 1]
+        frac_pos, mean_pred = calibration_curve(y_calib_eval, raw_prob, n_bins=10)
         ax.plot(mean_pred, frac_pos, marker="s", color=palette[0], label="Uncalibrated")
 
         for i, (method, (cal_model, brier)) in enumerate(results.items(), 1):
-            cal_prob = cal_model.predict_proba(X_calib)[:, 1]
-            frac_pos_c, mean_pred_c = calibration_curve(y_calib, cal_prob, n_bins=10)
+            cal_prob = cal_model.predict_proba(X_calib_eval)[:, 1]
+            frac_pos_c, mean_pred_c = calibration_curve(y_calib_eval, cal_prob, n_bins=10)
             ax.plot(mean_pred_c, frac_pos_c, marker="s", color=palette[i],
                     label=f"{method.capitalize()} (Brier={brier:.4f})")
 
         ax.plot([0, 1], [0, 1], "k--", lw=1, label="Perfect calibration")
         ax.set(xlabel="Mean predicted probability", ylabel="Fraction of positives",
-               title="Calibration Comparison", xlim=(0, 1), ylim=(0, 1))
+               title="Calibration Comparison (held-out eval)", xlim=(0, 1), ylim=(0, 1))
         ax.legend(loc="upper left", fontsize=9)
         out = _figures_dir(config) / "calibration_curve.png"
         fig.tight_layout(); fig.savefig(out, dpi=150, bbox_inches="tight"); plt.close(fig)
@@ -773,9 +761,11 @@ def threshold_sweep(
     lo       = thr_cfg.get("sweep_min",  0.05)
     hi       = thr_cfg.get("sweep_max",  0.95)
     step     = thr_cfg.get("sweep_step", 0.05)
-    optimize = thr_cfg.get("optimize_by", "f1")
+    optimize = thr_cfg.get("optimize_by", "recall")
+    recall_target = thr_cfg.get("recall_target", 0.80)
 
-    thresholds = np.arange(lo, hi + step / 2, step)
+    n_steps    = round((hi - lo) / step) + 1
+    thresholds = np.linspace(lo, hi, n_steps)   # linspace avoids float accumulation error
     y_prob     = model.predict_proba(X)[:, 1]
 
     rows = []
@@ -793,7 +783,17 @@ def threshold_sweep(
 
     sweep_df = pd.DataFrame(rows)
 
-    if optimize in sweep_df.columns:
+    if optimize == "recall":
+        # Find the highest-precision threshold where recall >= recall_target
+        candidates = sweep_df[sweep_df["recall"] >= recall_target]
+        if candidates.empty:
+            logger.warning(
+                "No threshold achieves recall >= %.2f. Falling back to max-F1.", recall_target
+            )
+            optimal = float(sweep_df.loc[sweep_df["f1"].idxmax(), "threshold"])
+        else:
+            optimal = float(candidates.loc[candidates["precision"].idxmax(), "threshold"])
+    elif optimize in sweep_df.columns:
         optimal = float(sweep_df.loc[sweep_df[optimize].idxmax(), "threshold"])
     else:
         logger.warning("optimize_by='%s' not in sweep columns — defaulting to f1.", optimize)

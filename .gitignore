@@ -46,3 +46,10 @@ env/
 # OS
 .DS_Store
 Thumbs.db
+
+# Legacy archive (kept locally, not committed)
+legacy/
+
+# Executed notebook snapshots
+notebooks/executed/
+*_executed.ipynb
