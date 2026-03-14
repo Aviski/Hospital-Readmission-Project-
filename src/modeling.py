@@ -130,7 +130,14 @@ def load_features(
             "Run: clean_data → create_features → encode_features → save CSV"
         )
 
-    df = pd.read_csv(path)
+    try:
+        df = pd.read_csv(path, index_col="row_id")
+    except ValueError:
+        logger.warning(
+            "Features CSV does not contain row_id; loading with default integer index: %s",
+            path,
+        )
+        df = pd.read_csv(path)
     logger.info("Loaded feature dataset: %d rows × %d columns", *df.shape)
 
     # Sanitise column names

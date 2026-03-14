@@ -8,12 +8,15 @@
 paths:
   raw_data:      "data/raw/hospital_readmissions.csv"
   features_data: "data/processed/readmission_features.csv"
+  analysis_features_data: "data/processed/readmission_features_raw.csv"
+  features_metadata: "data/processed/features_metadata.json"
   model_dir:     "models/"
   figures_dir:   "reports/figures/"
   metrics_out:   "data/processed/metrics_summary.csv"
   metrics_tuned: "data/processed/metrics_tuned_summary.csv"
 
 random_seed: 42
+cache_version: 1
 
 # ---------------------------------------------------------------------------
 # Data preparation
@@ -59,8 +62,6 @@ data:
     - "diabetes_med"
 
   numeric_impute_strategy: "median"
-  # Note: "Missing" in medical_specialty is a valid category, not NaN —
-  # do NOT impute it. No clip_values needed for this dataset.
 
 # ---------------------------------------------------------------------------
 # Feature engineering

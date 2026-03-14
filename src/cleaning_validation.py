@@ -19,8 +19,8 @@ import sys
 
 import pandas as pd
 
-from src.data_preparation import clean_data, encode_features, load_raw_data
-from src.feature_engineering import create_features
+from src.data_preparation import load_raw_data
+from src.pipeline import build_feature_artifacts
 from src.utils import get_logger, load_config, set_seed
 
 logger = get_logger(__name__)
@@ -68,36 +68,6 @@ def _check_duplicates(raw_df: pd.DataFrame, clean_df: pd.DataFrame) -> CheckResu
         True,
         f"Raw duplicates={raw_dupes}; cleaned duplicates={clean_dupes}",
     )
-
-
-def _check_clip_rules(clean_df: pd.DataFrame, config: dict) -> list[CheckResult]:
-    results: list[CheckResult] = []
-    clip_cfg: dict = config.get("data", {}).get("clip_values", {})
-
-    for col, bounds in clip_cfg.items():
-        if col not in clean_df.columns:
-            results.append(
-                CheckResult(
-                    f"clip_rule_{col}",
-                    False,
-                    f"Configured clip column '{col}' is missing after cleaning",
-                )
-            )
-            continue
-
-        lo, hi = bounds[0], bounds[1]
-        below = int((clean_df[col] < lo).sum()) if lo is not None else 0
-        above = int((clean_df[col] > hi).sum()) if hi is not None else 0
-        passed = below == 0 and above == 0
-        results.append(
-            CheckResult(
-                f"clip_rule_{col}",
-                passed,
-                f"lower_violations={below}, upper_violations={above}",
-            )
-        )
-
-    return results
 
 
 def _check_missing_after_cleaning(clean_df: pd.DataFrame, target: str) -> list[CheckResult]:
@@ -186,6 +156,30 @@ def _check_encoding(df_encoded: pd.DataFrame, config: dict, target: str) -> list
     return results
 
 
+def _check_artifact_row_counts(
+    df_analysis: pd.DataFrame,
+    df_encoded: pd.DataFrame,
+) -> CheckResult:
+    return CheckResult(
+        "analysis_encoded_row_count_match",
+        len(df_analysis) == len(df_encoded),
+        f"analysis_rows={len(df_analysis)}, encoded_rows={len(df_encoded)}",
+    )
+
+
+def _check_artifact_index_alignment(
+    df_analysis: pd.DataFrame,
+    df_encoded: pd.DataFrame,
+) -> CheckResult:
+    aligned = df_analysis.index.equals(df_encoded.index)
+    detail = (
+        "row_id index alignment preserved"
+        if aligned
+        else "row_id index alignment mismatch between analysis and encoded artifacts"
+    )
+    return CheckResult("analysis_encoded_index_match", aligned, detail)
+
+
 def run_validation(config_path: str | Path | None = None) -> tuple[list[CheckResult], dict[str, pd.DataFrame]]:
     root = _resolve_project_root()
     cfg_path = Path(config_path) if config_path else root / "config" / "config.yaml"
@@ -196,14 +190,16 @@ def run_validation(config_path: str | Path | None = None) -> tuple[list[CheckRes
     target = config["data"]["target_column"]
 
     raw_df = load_raw_data(raw_path)
-    clean_df = clean_data(raw_df, config)
-    feat_df = create_features(clean_df, config)
-    encoded_df = encode_features(feat_df, config)
+    artifacts = build_feature_artifacts(config, base_dir=root)
+    clean_df = artifacts.clean
+    feat_df = artifacts.analysis
+    encoded_df = artifacts.encoded
 
     results: list[CheckResult] = []
     results.append(_check_target(clean_df, target))
     results.append(_check_duplicates(raw_df, clean_df))
-    results.extend(_check_clip_rules(clean_df, config))
+    results.append(_check_artifact_row_counts(feat_df, encoded_df))
+    results.append(_check_artifact_index_alignment(feat_df, encoded_df))
     results.extend(_check_missing_after_cleaning(clean_df, target))
     results.extend(_check_feature_generation(feat_df))
     results.extend(_check_encoding(encoded_df, config, target))

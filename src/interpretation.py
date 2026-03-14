@@ -268,13 +268,13 @@ def summarise_errors(
     -------
     pd.DataFrame with rows = error groups, columns = mean numeric stats.
     """
-    AUTO_COLS = [
-        "age_ordinal", "time_in_hospital", "n_medications",
-        "n_lab_procedures", "n_inpatient", "n_emergency",
-        "total_prior_utilization",
+    target_col = config.get("data", {}).get("target_column", "readmitted")
+    default_cols = [
+        c for c in df_original.select_dtypes(include="number").columns
+        if c != target_col
     ]
     if numeric_cols is None:
-        numeric_cols = [c for c in AUTO_COLS if c in df_original.columns]
+        numeric_cols = default_cols
 
     rows = []
     for name, idx in groups.items():
@@ -295,11 +295,11 @@ def plot_error_distributions(
     config: dict,
 ) -> None:
     """Violin plots comparing key numeric features across FP / FN / TP / TN."""
-    AUTO_COLS = [
-        "age_ordinal", "time_in_hospital", "n_medications",
-        "n_inpatient", "total_prior_utilization",
+    target_col = config.get("data", {}).get("target_column", "readmitted")
+    plot_cols = [
+        c for c in df_original.select_dtypes(include="number").columns
+        if c != target_col
     ]
-    plot_cols = [c for c in AUTO_COLS if c in df_original.columns]
     if not plot_cols:
         logger.warning("No numeric columns available for error distribution plot.")
         return
@@ -379,12 +379,11 @@ def plot_false_positive_vs_negative(
     config: dict,
 ) -> None:
     """Side-by-side bar chart: FP vs FN mean statistics for key numeric features."""
-    AUTO_COLS = [
-        "age_ordinal", "time_in_hospital", "n_medications",
-        "n_lab_procedures", "n_inpatient", "n_emergency",
-        "total_prior_utilization",
+    target_col = config.get("data", {}).get("target_column", "readmitted")
+    plot_cols = [
+        c for c in df_original.select_dtypes(include="number").columns
+        if c != target_col
     ]
-    plot_cols = [c for c in AUTO_COLS if c in df_original.columns]
     if not plot_cols:
         return
 
@@ -428,8 +427,11 @@ def plot_error_diagnosis_distribution(
 ) -> None:
     """Stacked bar: primary diagnosis distribution for FP and FN."""
     if diag_col not in df_original.columns:
-        logger.warning("'%s' not in df — skipping diagnosis plot.", diag_col)
-        return
+        raise ValueError(
+            f"diag_col '{diag_col}' not found in the provided DataFrame. "
+            "Pass the pre-OHE analysis frame (readmission_features_raw.csv aligned to X_val.index), "
+            "not the encoded feature matrix."
+        )
 
     fp_idx = groups.get("FP", pd.Index([]))
     fn_idx = groups.get("FN", pd.Index([]))

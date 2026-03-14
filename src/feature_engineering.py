@@ -105,13 +105,12 @@ def _map_age_to_ordinal(df: pd.DataFrame, feat_cfg: dict) -> pd.DataFrame:
     n_unmapped = df["age_ordinal"].isna().sum()
     if n_unmapped > 0:
         unmapped_vals = df.loc[df["age_ordinal"].isna(), "age"].unique().tolist()
-        logger.warning(
-            "%d rows have unmapped age values: %s. "
-            "Add entries to features.age_brackets in config.yaml.",
-            n_unmapped, unmapped_vals,
+        raise ValueError(
+            f"Unmapped age values found: {unmapped_vals}. "
+            "Add them to config['features']['age_brackets'] in config/config.yaml."
         )
 
-    df["age_ordinal"] = df["age_ordinal"].astype(float).astype(int)
+    df["age_ordinal"] = df["age_ordinal"].astype(int)
     df.drop(columns=["age"], inplace=True)
     logger.info("Created 'age_ordinal' from 'age'; dropped original 'age' column.")
     return df
