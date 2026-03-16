@@ -298,7 +298,11 @@ def cross_validate_model(
     seed     = config.get("random_seed", 42)
     cv       = StratifiedKFold(n_splits=cv_folds, shuffle=True, random_state=seed)
 
-    logger.info("Cross-validating %s (%d folds)...", type(model).__name__, cv_folds)
+    logger.info(
+        "Cross-validating %s (%d folds)...",
+        _inner_estimator(model).__class__.__name__,
+        cv_folds,
+    )
     results = cross_validate(
         model, X_train, y_train,
         cv=cv,
@@ -510,7 +514,7 @@ def build_param_distributions(model_name: str, config: dict) -> dict:
     Parameters
     ----------
     model_name : one of ``"LogisticRegression"``, ``"RandomForest"``,
-                 ``"GradientBoosting"``, ``"XGBoost"``.
+                 ``"GradientBoosting"``.
     config     : parsed config dict.
 
     Returns
@@ -544,12 +548,6 @@ def build_param_distributions(model_name: str, config: dict) -> dict:
             "max_iter":         [100, 150, 200],
             "max_depth":        [3, 4, 5, 6],
             "min_samples_leaf": [10, 20, 30],
-        },
-        "XGBoost": {
-            "learning_rate":    [0.01, 0.05, 0.1, 0.2],
-            "n_estimators":     [100, 200, 300],
-            "max_depth":        [3, 4, 5, 6],
-            "subsample":        [0.7, 0.8, 0.9],
         },
     }
     return defaults.get(model_name, {})

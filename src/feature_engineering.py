@@ -125,7 +125,13 @@ def _add_prior_utilization_flags(df: pd.DataFrame, feat_cfg: dict) -> pd.DataFra
     Configuration key: ``features.prior_utilization_cols`` — list of column
     names (e.g. ``["n_inpatient", "n_emergency"]``).
     """
-    cols: list[str] = feat_cfg.get("prior_utilization_cols", ["n_inpatient", "n_emergency"])
+    cols: list[str] = feat_cfg.get("prior_utilization_cols", [])
+    if not cols:
+        logger.warning(
+            "features.prior_utilization_cols not set in config — "
+            "skipping prior utilization flags."
+        )
+        return df
     created = []
     for col in cols:
         if col not in df.columns:

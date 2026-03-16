@@ -102,7 +102,7 @@ model:
   # Populate once encoding output is confirmed.
   drop_redundant_cols: []
 
-  cv_folds: 5
+  cv_folds: 5   # used by cross_validate_model(); keep in sync with tuning.cv_folds
 
   # ---- Logistic Regression (wrapped in StandardScaler Pipeline) -----------
   logistic_regression:
@@ -132,9 +132,8 @@ model:
   # ---- Hyperparameter tuning ----------------------------------------------
   tuning:
     n_iter:        20
-    cv_folds:      5
+    cv_folds:      5   # used by tune_model(); keep in sync with model.cv_folds
     scoring:       "roc_auc"
-    recall_target: 0.80   # used when optimize_by="recall"
 
     param_spaces:
       LogisticRegression:

@@ -217,7 +217,7 @@ def _print_summary(results: list[CheckResult], frames: dict[str, pd.DataFrame]) 
     print("=" * 80)
     print(f"raw shape      : {frames['raw'].shape}")
     print(f"clean shape    : {frames['clean'].shape}")
-    print(f"features shape : {frames['features'].shape}")
+    print(f"analysis shape : {frames['features'].shape}")
     print(f"encoded shape  : {frames['encoded'].shape}")
     print("")
 
