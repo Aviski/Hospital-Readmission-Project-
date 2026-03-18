@@ -105,7 +105,7 @@ def compute_shap_values(
 
     try:
         explainer   = shap.Explainer(predict_fn, background, feature_names=feature_names)
-        shap_values = explainer(X_sample)
+        shap_values = explainer(X_sample, silent=True)
 
     except (ValueError, TypeError, ImportError) as exc:
         logger.warning(
@@ -114,7 +114,7 @@ def compute_shap_values(
         )
         explainer   = shap.PermutationExplainer(predict_fn, background,
                                                 feature_names=feature_names)
-        shap_values = explainer(X_sample)
+        shap_values = explainer(X_sample, silent=True)
 
     logger.info("SHAP values computed. Shape: %s", shap_values.values.shape)
     return shap_values, X_sample
@@ -321,8 +321,8 @@ def plot_error_distributions(
         col_data = long_df[long_df["feature"] == col]
         fig, ax = plt.subplots(figsize=(8, 4))
         sns.violinplot(data=col_data, x="group", y="value",
-                       palette=palette, order=["TP", "TN", "FP", "FN"],
-                       inner="box", ax=ax)
+                       hue="group", palette=palette, order=["TP", "TN", "FP", "FN"],
+                       dodge=False, legend=False, inner="box", ax=ax)
         ax.set(title=f"{col} — distribution by prediction group",
                xlabel="Prediction group", ylabel=col)
         safe = col.lower().replace(" ", "_")

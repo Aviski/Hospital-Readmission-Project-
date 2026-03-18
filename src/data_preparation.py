@@ -39,6 +39,20 @@ def _normalize_target_label(value: object) -> str | None:
 
 def _load_expected_feature_columns(config: dict) -> list[str] | None:
     """Load the persisted training feature schema from metadata when available."""
+    metadata = _load_feature_metadata(config)
+    if metadata is None:
+        return None
+
+    feature_columns = metadata.get("feature_columns")
+    if not isinstance(feature_columns, list) or not all(
+        isinstance(col, str) for col in feature_columns
+    ):
+        return None
+    return feature_columns
+
+
+def _load_feature_metadata(config: dict) -> dict | None:
+    """Load persisted feature metadata when available."""
     metadata_rel = config.get("paths", {}).get("features_metadata")
     if not metadata_rel:
         return None
@@ -54,12 +68,56 @@ def _load_expected_feature_columns(config: dict) -> list[str] | None:
         logger.warning("Could not read feature metadata at %s: %s", metadata_path, exc)
         return None
 
-    feature_columns = metadata.get("feature_columns")
-    if not isinstance(feature_columns, list) or not all(
-        isinstance(col, str) for col in feature_columns
-    ):
+    if not isinstance(metadata, dict):
         return None
-    return feature_columns
+    return metadata
+
+
+def _load_expected_categorical_levels(config: dict) -> dict[str, set[str]] | None:
+    """Load persisted training category levels keyed by column name."""
+    metadata = _load_feature_metadata(config)
+    if metadata is None:
+        return None
+
+    raw_levels = metadata.get("categorical_levels")
+    if not isinstance(raw_levels, dict):
+        return None
+
+    levels: dict[str, set[str]] = {}
+    for column, values in raw_levels.items():
+        if not isinstance(column, str) or not isinstance(values, list):
+            continue
+        valid_values = {str(value) for value in values if isinstance(value, str)}
+        if valid_values:
+            levels[column] = valid_values
+    return levels or None
+
+
+def _warn_on_unseen_categories(
+    df: pd.DataFrame,
+    expected_levels: dict[str, set[str]] | None,
+    target: str,
+) -> None:
+    """Warn when inference data contains categorical levels absent from training metadata."""
+    if not expected_levels:
+        return
+
+    categorical_columns = [
+        c for c in df.select_dtypes(include=["object", "category", "string"]).columns
+        if c != target and c in expected_levels
+    ]
+    for column in categorical_columns:
+        observed_values = {
+            str(value)
+            for value in pd.Series(df[column]).dropna().astype(str).unique().tolist()
+        }
+        unseen_values = sorted(value for value in observed_values if value not in expected_levels[column])
+        if unseen_values:
+            logger.warning(
+                "Unseen categorical value(s) in '%s': %s",
+                column,
+                unseen_values,
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -302,6 +360,9 @@ def encode_features(
     data_cfg = config.get("data", {})
     target = data_cfg.get("target_column", "readmitted")
     original_has_target = target in df.columns
+    expected_category_levels = _load_expected_categorical_levels(config)
+
+    _warn_on_unseen_categories(df, expected_category_levels, target)
 
     # First pass: explicitly configured columns (if any)
     explicit_cols: list[str] = data_cfg.get("categorical_columns", [])
