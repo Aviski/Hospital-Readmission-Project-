@@ -320,8 +320,6 @@ joblib >= 1.3
 jupyter >= 1.0
 ```
 
-No XGBoost, LightGBM, or imbalanced-learn dependencies.
-
 ---
 
 ## License / Repository Notes
