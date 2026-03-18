@@ -33,7 +33,7 @@
 | `A1Ctest` | categorical | HbA1c test result: no / normal / high |
 | `change` | categorical | Medication change during stay: yes / no |
 | `diabetes_med` | categorical | Diabetes medication prescribed: yes / no |
-| `readmitted` | binary target | Readmitted within 30 days |
+| `readmitted` | binary target | Binary readmission indicator used in this dataset |
 
 No missing values in the raw dataset. No rows required imputation.
 

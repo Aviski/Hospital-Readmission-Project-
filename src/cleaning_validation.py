@@ -42,7 +42,28 @@ def _check_target(df: pd.DataFrame, target: str) -> CheckResult:
     if target not in df.columns:
         return CheckResult("target_present", False, f"Missing target column '{target}'")
 
-    unique_vals = set(pd.Series(df[target]).dropna().astype(int).unique().tolist())
+    target_series = pd.Series(df[target]).dropna()
+    numeric_target = pd.to_numeric(target_series, errors="coerce")
+
+    invalid_mask = numeric_target.isna()
+    if invalid_mask.any():
+        invalid_values = sorted(target_series[invalid_mask].astype(str).unique().tolist())
+        return CheckResult(
+            "target_binary",
+            False,
+            f"Target contains non-numeric values after cleaning: {invalid_values}",
+        )
+
+    non_integer_mask = numeric_target.mod(1).ne(0)
+    if non_integer_mask.any():
+        non_integer_values = sorted(numeric_target[non_integer_mask].unique().tolist())
+        return CheckResult(
+            "target_binary",
+            False,
+            f"Target contains non-integer numeric values: {non_integer_values}",
+        )
+
+    unique_vals = set(numeric_target.astype(int).unique().tolist())
     if not unique_vals.issubset({0, 1}):
         return CheckResult(
             "target_binary",
@@ -184,6 +205,7 @@ def run_validation(config_path: str | Path | None = None) -> tuple[list[CheckRes
     root = _resolve_project_root()
     cfg_path = Path(config_path) if config_path else root / "config" / "config.yaml"
     config = load_config(cfg_path)
+    config["_base_dir"] = str(root)
     set_seed(int(config.get("random_seed", 42)))
 
     raw_path = root / config["paths"]["raw_data"]
@@ -233,7 +255,14 @@ def _print_summary(results: list[CheckResult], frames: dict[str, pd.DataFrame]) 
 
 
 def main() -> int:
-    results, frames = run_validation()
+    try:
+        results, frames = run_validation()
+    except Exception as exc:
+        print("Cleaning Validation Summary")
+        print("=" * 80)
+        print(f"[FAIL] preprocessing_pipeline: {exc}")
+        return 1
+
     _print_summary(results, frames)
     required_failures = [r for r in results if not r.passed and r.severity != "warning"]
     return 1 if required_failures else 0

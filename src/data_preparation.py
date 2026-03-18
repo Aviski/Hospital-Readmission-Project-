@@ -20,6 +20,7 @@ functions always have access to the original categorical columns.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pandas as pd
@@ -27,6 +28,38 @@ import pandas as pd
 from src.utils import get_logger
 
 logger = get_logger(__name__)
+
+
+def _normalize_target_label(value: object) -> str | None:
+    """Normalize a raw target label for strict validation and mapping."""
+    if pd.isna(value):
+        return None
+    return str(value).strip().lower()
+
+
+def _load_expected_feature_columns(config: dict) -> list[str] | None:
+    """Load the persisted training feature schema from metadata when available."""
+    metadata_rel = config.get("paths", {}).get("features_metadata")
+    if not metadata_rel:
+        return None
+
+    base_dir = config.get("_base_dir")
+    metadata_path = Path(base_dir) / metadata_rel if base_dir else Path(metadata_rel)
+    if not metadata_path.exists():
+        return None
+
+    try:
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        logger.warning("Could not read feature metadata at %s: %s", metadata_path, exc)
+        return None
+
+    feature_columns = metadata.get("feature_columns")
+    if not isinstance(feature_columns, list) or not all(
+        isinstance(col, str) for col in feature_columns
+    ):
+        return None
+    return feature_columns
 
 
 # ---------------------------------------------------------------------------
@@ -103,12 +136,60 @@ def clean_data(df: pd.DataFrame, config: dict) -> pd.DataFrame:
     # ------------------------------------------------------------------
     # 0. Map target from string to binary
     # ------------------------------------------------------------------
-    if target in df.columns and not pd.api.types.is_numeric_dtype(df[target]):
-        pos_val = data_cfg.get("target_positive_value", "yes")
-        df[target] = (df[target].str.lower() == pos_val.lower()).astype(int)
-        logger.info(
-            "Mapped target '%s': '%s'→1, others→0", target, pos_val
-        )
+    if target in df.columns:
+        if pd.api.types.is_numeric_dtype(df[target]):
+            missing_count = int(df[target].isna().sum())
+            if missing_count:
+                raise ValueError(
+                    f"Target '{target}' contains {missing_count} missing value(s)."
+                )
+            unique_vals = set(pd.Series(df[target]).dropna().unique())
+            if not unique_vals.issubset({0, 1}):
+                raise ValueError(
+                    f"Target '{target}' must contain only 0/1 when numeric. "
+                    f"Found: {sorted(unique_vals)}"
+                )
+            df[target] = df[target].astype("int8")
+        else:
+            pos_val = _normalize_target_label(
+                data_cfg.get("target_positive_value", "yes")
+            )
+            neg_val = _normalize_target_label(
+                data_cfg.get("target_negative_value", "no")
+            )
+            if not pos_val or not neg_val or pos_val == neg_val:
+                raise ValueError(
+                    "Target mapping config must define distinct non-empty "
+                    "positive and negative values."
+                )
+
+            normalized_target = df[target].map(_normalize_target_label)
+            missing_mask = normalized_target.isna()
+            if missing_mask.any():
+                raise ValueError(
+                    f"Target '{target}' contains {int(missing_mask.sum())} missing value(s)."
+                )
+
+            allowed_values = {pos_val, neg_val}
+            invalid_mask = ~normalized_target.isin(allowed_values)
+            if invalid_mask.any():
+                invalid_values = sorted(
+                    df.loc[invalid_mask, target].astype(str).drop_duplicates().tolist()
+                )
+                preview = invalid_values[:5]
+                suffix = " ..." if len(invalid_values) > 5 else ""
+                raise ValueError(
+                    f"Unexpected target label(s) in '{target}': {preview}{suffix}. "
+                    f"Expected only '{pos_val}' or '{neg_val}' (case/whitespace-insensitive)."
+                )
+
+            df[target] = normalized_target.map({neg_val: 0, pos_val: 1}).astype("int8")
+            logger.info(
+                "Mapped target '%s': '%s'→1, '%s'→0",
+                target,
+                pos_val,
+                neg_val,
+            )
 
     # ------------------------------------------------------------------
     # 1. Drop unwanted columns
@@ -186,7 +267,11 @@ def clean_data(df: pd.DataFrame, config: dict) -> pd.DataFrame:
 # Encoding  (run AFTER feature engineering)
 # ---------------------------------------------------------------------------
 
-def encode_features(df: pd.DataFrame, config: dict) -> pd.DataFrame:
+def encode_features(
+    df: pd.DataFrame,
+    config: dict,
+    expected_feature_columns: list[str] | None = None,
+) -> pd.DataFrame:
     """One-hot encode categorical columns.
 
     This step is intentionally separated from ``clean_data`` so that
@@ -208,10 +293,15 @@ def encode_features(df: pd.DataFrame, config: dict) -> pd.DataFrame:
     pd.DataFrame
         DataFrame with categorical columns replaced by OHE dummy columns.
         Boolean dummy columns are cast to ``int8`` for compatibility with
-        scikit-learn and serialisation formats.
+        scikit-learn and serialisation formats. When an expected training
+        feature schema is supplied (or discoverable from metadata for
+        target-less scoring data), columns are deterministically reindexed
+        to that schema with missing dummies filled as 0.
     """
+    df = df.copy()
     data_cfg = config.get("data", {})
     target = data_cfg.get("target_column", "readmitted")
+    original_has_target = target in df.columns
 
     # First pass: explicitly configured columns (if any)
     explicit_cols: list[str] = data_cfg.get("categorical_columns", [])
@@ -245,6 +335,31 @@ def encode_features(df: pd.DataFrame, config: dict) -> pd.DataFrame:
         raise ValueError(
             f"Encoding incomplete — categorical columns remain: {remaining_after}"
         )
+
+    if expected_feature_columns is None and not original_has_target:
+        expected_feature_columns = _load_expected_feature_columns(config)
+
+    if expected_feature_columns:
+        target_series = df[target].copy() if original_has_target else None
+        encoded_feature_columns = [c for c in df.columns if c != target]
+        missing_cols = [c for c in expected_feature_columns if c not in encoded_feature_columns]
+        extra_cols = [c for c in encoded_feature_columns if c not in expected_feature_columns]
+
+        df = df.reindex(columns=expected_feature_columns, fill_value=0)
+        if target_series is not None:
+            df[target] = target_series
+
+        if extra_cols:
+            logger.warning(
+                "Aligned encoded features to expected schema and dropped %d unexpected column(s); added=%d",
+                len(extra_cols),
+                len(missing_cols),
+            )
+        elif missing_cols:
+            logger.info(
+                "Aligned encoded features to expected schema: added=%d dropped=0",
+                len(missing_cols),
+            )
 
     logger.info("Encoding complete. Shape: %d rows × %d columns", df.shape[0], df.shape[1])
     return df

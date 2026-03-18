@@ -2,7 +2,7 @@
 # Hospital Readmission Predictor — Central Configuration
 # Dataset: hospital_readmissions.csv
 # Rows: 25,000 | Columns: 17 | Target: readmitted (yes/no → 1/0)
-# Positive rate: ~45.3% (nearly balanced)
+# Positive rate: 47.0% (nearly balanced)
 # =============================================================================
 
 paths:
@@ -16,7 +16,7 @@ paths:
   metrics_tuned: "data/processed/metrics_tuned_summary.csv"
 
 random_seed: 42
-cache_version: 1
+cache_version: 2
 
 # ---------------------------------------------------------------------------
 # Data preparation
@@ -24,6 +24,7 @@ cache_version: 1
 data:
   target_column:        "readmitted"
   target_positive_value: "yes"   # mapped to 1; "no" → 0
+  target_negative_value: "no"    # mapped to 0
   test_size:  0.20
   val_size:   0.20
   stratify:   true

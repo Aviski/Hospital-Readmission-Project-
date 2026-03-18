@@ -1,6 +1,6 @@
 # Hospital Readmission Predictor
 
-An end-to-end machine learning pipeline for predicting **hospital readmission risk at discharge**, built on the `hospital_readmissions.csv` dataset (25,000 real-world diabetic patient records).
+An end-to-end machine learning pipeline for predicting **hospital readmission risk at discharge**, built on the checked-in `hospital_readmissions.csv` dataset (25,000 diabetic patient records).
 
 ---
 
@@ -69,8 +69,8 @@ hospital-readmission-risk/
 | **Rows** | 25,000 |
 | **Columns** | 17 |
 | **Target** | `readmitted` — `yes` → 1, `no` → 0 |
-| **Positive rate** | ~45.3% (nearly balanced) |
-| **Source** | Diabetic patient records (real-world clinical data) |
+| **Positive rate** | 47.0% (nearly balanced) |
+| **Source** | Diabetic patient records; detailed provenance is not documented in this repo |
 
 ### Feature Schema
 
@@ -145,7 +145,7 @@ df_encoded  = encode_features(df_features, config)
 
 ### Stage 1 — EDA (`notebooks/01_eda.ipynb`)
 - Shape, dtypes, summary statistics
-- Class balance (≈ 45/55 — no collapse risk)
+- Class balance (≈ 47/53 — no collapse risk)
 - Age bracket distribution, prior utilisation distributions
 - `medical_specialty` missingness (49.5% "Missing")
 - Correlation matrix, target correlations
@@ -220,4 +220,4 @@ No XGBoost, LightGBM, or imbalanced-learn dependencies.
 
 ## License
 
-MIT — see `LICENSE`.
+No `LICENSE` file is currently included in this checked-in repo state.

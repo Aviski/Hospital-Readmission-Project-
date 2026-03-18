@@ -630,21 +630,56 @@ class _PrefitCalibratedModel:
     method      : ``"sigmoid"`` or ``"isotonic"`` (for labelling / logging).
     """
 
-    def __init__(self, base_model: Any, calibrator: Any, method: str) -> None:
+    def __init__(
+        self,
+        base_model: Any,
+        calibrator: Any,
+        method: str,
+        threshold: float = 0.5,
+        feature_columns: list[str] | None = None,
+    ) -> None:
         self.base_model = base_model
         self.calibrator = calibrator
         self.method     = method
+        self.threshold  = float(threshold)
+        self.feature_columns = feature_columns
+
+    def _prepare_features(self, X: pd.DataFrame | np.ndarray) -> pd.DataFrame | np.ndarray:
+        if not self.feature_columns:
+            return X
+
+        if isinstance(X, pd.DataFrame):
+            missing_cols = [c for c in self.feature_columns if c not in X.columns]
+            extra_cols = [c for c in X.columns if c not in self.feature_columns]
+            if missing_cols or extra_cols:
+                logger.info(
+                    "Aligning inference features to trained schema: added=%d dropped=%d",
+                    len(missing_cols),
+                    len(extra_cols),
+                )
+            return X.reindex(columns=self.feature_columns, fill_value=0)
+
+        array = np.asarray(X)
+        if array.ndim != 2 or array.shape[1] != len(self.feature_columns):
+            raise ValueError(
+                "Input feature array shape does not match the trained schema. "
+                f"Expected {len(self.feature_columns)} feature columns, got "
+                f"{array.shape[1] if array.ndim == 2 else 'non-2D input'}."
+            )
+        return array
 
     def predict_proba(self, X: pd.DataFrame) -> np.ndarray:
-        raw = self.base_model.predict_proba(X)[:, 1]
+        prepared_X = self._prepare_features(X)
+        raw = self.base_model.predict_proba(prepared_X)[:, 1]
         if self.method == "sigmoid":
             cal_pos = self.calibrator.predict_proba(raw.reshape(-1, 1))[:, 1]
         else:
             cal_pos = np.clip(self.calibrator.predict(raw), 0.0, 1.0)
         return np.column_stack([1.0 - cal_pos, cal_pos])
 
-    def predict(self, X: pd.DataFrame, threshold: float = 0.5) -> np.ndarray:
-        return (self.predict_proba(X)[:, 1] >= threshold).astype(int)
+    def predict(self, X: pd.DataFrame, threshold: float | None = None) -> np.ndarray:
+        active_threshold = self.threshold if threshold is None else float(threshold)
+        return (self.predict_proba(X)[:, 1] >= active_threshold).astype(int)
 
 
 def _fit_prefit_calibrator(model: Any, X_calib: pd.DataFrame,
@@ -662,7 +697,8 @@ def _fit_prefit_calibrator(model: Any, X_calib: pd.DataFrame,
         cal.fit(raw, y_calib)
     else:
         raise ValueError(f"Unknown calibration method: '{method}'")
-    return _PrefitCalibratedModel(model, cal, method)
+    feature_columns = list(X_calib.columns) if isinstance(X_calib, pd.DataFrame) else None
+    return _PrefitCalibratedModel(model, cal, method, feature_columns=feature_columns)
 
 
 def calibrate_model(
