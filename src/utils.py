@@ -138,7 +138,7 @@ def load_model(path: str | Path) -> Any:
 # ---------------------------------------------------------------------------
 
 def set_seed(seed: int) -> None:
-    """Set random seeds for Python, NumPy, and (if available) PyTorch / TF.
+    """Set random seeds for Python, NumPy, and the hash seed environment variable.
 
     Parameters
     ----------
@@ -148,13 +148,5 @@ def set_seed(seed: int) -> None:
     random.seed(seed)
     np.random.seed(seed)
     os.environ["PYTHONHASHSEED"] = str(seed)
-
-    try:
-        import torch  # type: ignore
-        torch.manual_seed(seed)
-        if torch.cuda.is_available():
-            torch.cuda.manual_seed_all(seed)
-    except ImportError:
-        pass
 
     logging.getLogger(__name__).debug("Random seed set to %d", seed)

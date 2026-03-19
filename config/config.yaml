@@ -62,7 +62,6 @@ data:
     - "change"
     - "diabetes_med"
 
-  numeric_impute_strategy: "median"
 
 # ---------------------------------------------------------------------------
 # Feature engineering
@@ -100,7 +99,7 @@ model:
   exclude_columns: []
 
   # After OHE with drop_first=True, reference categories are already removed.
-  # Populate once encoding output is confirmed.
+  # Intentionally empty — supported by load_features() and kept for future use.
   drop_redundant_cols: []
 
   cv_folds: 5   # used by cross_validate_model(); keep in sync with tuning.cv_folds
