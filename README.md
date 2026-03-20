@@ -117,8 +117,8 @@ removed in sklearn 1.6+. Non-standard but self-contained and confined to `src/mo
    provenance is not documented in this repo.
 
 4. **Schema alignment is not production-grade** — Unseen categorical values at inference time
-   are dropped silently (with a WARNING). A fitted sklearn `OneHotEncoder` would be more robust
-   for production inference on arbitrary inputs.
+   are mapped to the reference level (with a WARNING logged to the console). A fitted sklearn
+   `OneHotEncoder` would be more robust for production inference on arbitrary inputs.
 
 5. **No temporal validation** — Records are not ordered chronologically. If the dataset has
    temporal structure, temporal leakage cannot be ruled out.
