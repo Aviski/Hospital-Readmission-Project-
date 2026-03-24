@@ -9,7 +9,7 @@ built on the checked-in `hospital_readmissions.csv` dataset (25,000 diabetic pat
 
 Hospital readmissions are costly and often associated with worse patient outcomes. A calibrated
 risk score at discharge could help care-management teams prioritise follow-up resources — phone
-calls, home visits, medication reconciliation — for the patients most likely to return.
+calls, home visits, medication reconciliation - for the patients most likely to return.
 
 This project demonstrates a complete ML pipeline in a healthcare context: data cleaning and
 validation, feature engineering, multi-model comparison, hyperparameter tuning, post-hoc
